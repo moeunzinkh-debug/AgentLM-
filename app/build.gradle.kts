@@ -45,8 +45,12 @@ android {
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfig = signingConfigs.getByName("release")
+      buildConfigField("String", "GEMINI_API_KEY", '""')
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug {
+      signingConfig = signingConfigs.getByName("debugConfig")
+      buildConfigField("String", "GEMINI_API_KEY", '""')
+    }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
