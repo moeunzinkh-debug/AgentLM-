@@ -1,0 +1,73 @@
+name: Compile diagnosis
+
+# Temporary helper on this PR: the Actions log artifact host is not reachable from the
+# authoring sandbox, so this workflow posts the compiler output back as a PR comment.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Prepare secrets and keystore
+        run: |
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v -keystore debug.keystore \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          if [ ! -f .env ] && [ -f .env.example ]; then
+            cp .env.example .env
+          fi
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.1"
+
+      - name: Compile debug sources
+        run: |
+          set +e
+          gradle :app:compileDebugKotlin --console=plain --no-daemon --stacktrace > /tmp/out.log 2>&1
+          echo "gradle_exit=$?" >> /tmp/out.log
+          {
+            echo "--- compiler errors ---"
+            grep -E "^e: |^w: .*(unresolved|expecting)" /tmp/out.log | head -n 120
+            echo "--- what went wrong ---"
+            grep -n -A 12 "What went wrong" /tmp/out.log | head -n 80
+            echo "--- tail ---"
+            tail -n 40 /tmp/out.log
+          } > /tmp/report.log
+          exit 0
+
+      - name: Report as PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "### Compile diagnosis (\`$(date -u +%H:%M:%S)\`)"
+            echo '```'
+            head -c 55000 /tmp/report.log
+            echo
+            echo '```'
+          } > /tmp/body.md
+          if [ -n "$PR" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -F body=@/tmp/body.md
+          else
+            cat /tmp/body.md
+          fi
