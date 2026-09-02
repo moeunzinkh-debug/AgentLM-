@@ -121,6 +121,8 @@ import coil.compose.AsyncImage
 import com.example.model.Agent
 import com.example.model.Attachment
 import com.example.model.ChatMessage
+import com.example.model.DownloadStatus
+import com.example.model.EngineKind
 import com.example.model.HFModelConfig
 import com.example.model.MessageRole
 import com.example.model.MessageStatus
@@ -270,6 +272,17 @@ fun ChatScreen(
                         EmptyChatState(
                             agent = currentAgent,
                             model = currentModel,
+                            offlineStatusText = localWeightsNote(
+                                onDevice = settings.activeEngine().kind == EngineKind.LOCAL_NATIVE,
+                                downloaded = downloadStates[currentModel.id]?.status ==
+                                    DownloadStatus.DOWNLOADED,
+                                anyDownloaded = downloadStates.values.any {
+                                    it.status == DownloadStatus.DOWNLOADED
+                                }
+                            ),
+                            offlineStatusOk = downloadStates.values.any {
+                                it.status == DownloadStatus.DOWNLOADED
+                            },
                             onOpenModelHub = { showModelSheet = true },
                             onSuggestionClick = { prompt ->
                                 viewModel.sendMessage(prompt)
@@ -1184,10 +1197,30 @@ fun PulsingCursor() {
     )
 }
 
+/**
+ * One honest sentence about whether the next reply is produced by this phone. Kept out of the
+ * composable so the wording can be unit-tested without a Compose host.
+ */
+internal fun localWeightsNote(
+    onDevice: Boolean,
+    downloaded: Boolean,
+    anyDownloaded: Boolean
+): String? = when {
+    !onDevice -> null
+    downloaded -> "Running on this device — the selected weights are local, no network needed."
+    anyDownloaded ->
+        "On-device engine selected, but this model's weights are not on disk yet. Download them " +
+            "in Model Hub, or the reply will fall back to a configured server."
+    else ->
+        "On-device engine: nothing downloaded yet. Open Model Hub and download a Q4 file that fits " +
+            "your RAM — answers are then generated offline, with no API key."
+}
 @Composable
 fun EmptyChatState(
     agent: Agent,
     model: HFModelConfig,
+    offlineStatusText: String? = null,
+    offlineStatusOk: Boolean = false,
     onOpenModelHub: () -> Unit,
     onSuggestionClick: (String) -> Unit,
     onAttachZip: () -> Unit,
@@ -1276,6 +1309,55 @@ fun EmptyChatState(
             fontSize = 13.sp,
             color = Slate400
         )
+
+        // Tells the user, before they type anything, whether this conversation will run on the
+        // phone itself — and exactly which button fixes it when it will not.
+        if (offlineStatusText != null) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(
+                        if (offlineStatusOk) Emerald400.copy(alpha = 0.10f)
+                        else Amber400.copy(alpha = 0.08f)
+                    )
+                    .border(
+                        1.dp,
+                        if (offlineStatusOk) Emerald400.copy(alpha = 0.30f)
+                        else Amber400.copy(alpha = 0.35f),
+                        RoundedCornerShape(12.dp)
+                    )
+                    .clickable(enabled = !offlineStatusOk, onClick = onOpenModelHub)
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (offlineStatusOk) "●" else "▲",
+                    fontSize = 10.sp,
+                    color = if (offlineStatusOk) Emerald400 else Amber400
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = offlineStatusText,
+                    fontSize = 11.sp,
+                    color = Slate300,
+                    lineHeight = 15.sp,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                if (!offlineStatusOk) {
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Open",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Cyan300
+                    )
+                }
+            }
+        }
 
         Spacer(modifier = Modifier.height(24.dp))
 
