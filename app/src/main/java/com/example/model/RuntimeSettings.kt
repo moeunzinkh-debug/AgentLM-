@@ -127,6 +127,14 @@ data class ResponsePolicy(
     val temperature: Double = -1.0,
     val topP: Double = -1.0,
     val topK: Int = -1,
+    /** Cores deliberately left for Android/UI. -1 = auto from the device tier (never 0). */
+    val cpuReserveCores: Int = -1,
+    /**
+     * Run generation on BACKGROUND-priority threads. The native runtime spawns its worker
+     * threads from the thread that calls `initialize()`, and Linux children inherit the parent's
+     * nice value - so this caps how much of the SoC a reply is allowed to take.
+     */
+    val lowPriorityInference: Boolean = true,
     /** UI coalescing: at most one recomposition per interval. */
     val flushIntervalMs: Long = 90L,
     /** Also flush early once this many new chars accumulated. */
@@ -155,7 +163,33 @@ data class ResponsePolicy(
         (if (historyTurnsOverride > 0) historyTurnsOverride else deviceCap).coerceIn(0, 24)
 
     fun effectiveThreads(cores: Int): Int =
-        (if (cpuThreads > 0) cpuThreads else (cores / 2).coerceAtLeast(1)).coerceIn(1, 16)
+        resolvedThreads(cores, usingGpu = gpuEnabled, forceSingleThread = false)
+
+    /**
+     * The anti-freeze rule taken from the reference client (`inference_android.dart:104-128`):
+     * **never hand the model every core.** A GPU-fed run gets 4 threads, a CPU run 6/5/4/3 by
+     * tier, Tensor+Gemma gets exactly 1, and at least one core always stays free for Android's
+     * UI, input and SurfaceFlinger threads. Oversubscribed native threads are what make the whole
+     * phone stutter for seconds while a reply is being decoded.
+     */
+    fun resolvedThreads(cores: Int, usingGpu: Boolean, forceSingleThread: Boolean): Int {
+        val c = cores.coerceAtLeast(1)
+        if (forceSingleThread) return 1
+        if (cpuThreads > 0) return cpuThreads.coerceIn(1, c)
+        val cap = if (usingGpu) 4 else when {
+            c >= 10 -> 6
+            c >= 8 -> 5
+            c >= 6 -> 4
+            else -> 3
+        }
+        val reserve = if (cpuReserveCores >= 0) cpuReserveCores.coerceIn(0, (c - 1).coerceAtLeast(0))
+        else (c - cap).coerceAtLeast(1)
+        return (c - reserve).coerceIn(1, cap.coerceAtMost(c))
+    }
+
+    /** Cores deliberately left for the system after [resolvedThreads]. */
+    fun freeCoresForSystem(cores: Int, usingGpu: Boolean, forceSingleThread: Boolean): Int =
+        (cores.coerceAtLeast(1) - resolvedThreads(cores, usingGpu, forceSingleThread)).coerceAtLeast(0)
 }
 
 enum class SafetyMode(val label: String, val blurb: String) {
@@ -252,6 +286,8 @@ class RuntimeSettingsRepository private constructor(
             .put("gpuEnabled", p.gpuEnabled)
             .put("fallbackGpuToCpu", p.fallbackGpuToCpu)
             .put("quantization", p.quantization)
+            .put("cpuReserveCores", p.cpuReserveCores)
+            .put("lowPriorityInference", p.lowPriorityInference)
             .put("temperature", p.temperature)
             .put("topP", p.topP)
             .put("topK", p.topK)
@@ -301,6 +337,8 @@ class RuntimeSettingsRepository private constructor(
                 gpuEnabled = obj.optBoolean("gpuEnabled", true),
                 fallbackGpuToCpu = obj.optBoolean("fallbackGpuToCpu", true),
                 quantization = obj.optString("quantization", "Q4_K_M"),
+                cpuReserveCores = obj.optInt("cpuReserveCores", -1),
+                lowPriorityInference = obj.optBoolean("lowPriorityInference", true),
                 temperature = obj.optDouble("temperature", -1.0),
                 topP = obj.optDouble("topP", -1.0),
                 topK = obj.optInt("topK", -1),

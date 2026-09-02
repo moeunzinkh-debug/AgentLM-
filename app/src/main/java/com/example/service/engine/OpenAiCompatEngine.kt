@@ -259,6 +259,15 @@ class OpenAiCompatEngine(
         if (request.topK > 0 && request.topK != 40) {
             body.put("top_k", request.topK)
         }
+        // Ollama / llama.cpp servers accept an `options` object; sending it only to the local
+        // ports keeps strict OpenAI-compatible endpoints untouched. This is the same thread cap
+        // the reference app applies in-process, expressed over HTTP.
+        val localServer = baseUrl.contains(":11434") || baseUrl.contains(":8080") ||
+            baseUrl.contains(":1234") || baseUrl.contains("localhost", true) ||
+            baseUrl.contains("127.0.0.1") || baseUrl.contains("ollama", true)
+        if (localServer && request.cpuThreads > 0) {
+            body.put("options", JSONObject().put("num_thread", request.cpuThreads))
+        }
         if (request.stopSequences.isNotEmpty()) {
             body.put("stop", JSONArray(request.stopSequences))
         }

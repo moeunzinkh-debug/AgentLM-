@@ -32,6 +32,10 @@ data class EngineRequest(
     val topP: Double = 0.9,
     /** Candidate pool for the sampler; on-device engines honour it directly. */
     val topK: Int = 40,
+    /** Hard cap on worker threads for this turn — the value that keeps the phone usable. */
+    val cpuThreads: Int = 0,
+    /** Run the turn on background-priority threads (see InferenceThreads). */
+    val lowPriorityInference: Boolean = true,
     val stopSequences: List<String> = emptyList()
 )
 

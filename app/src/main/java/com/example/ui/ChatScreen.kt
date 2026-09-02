@@ -328,7 +328,9 @@ fun ChatScreen(
                 // hint points straight at the control that owns it instead of leaving the user
                 // guessing that the app "froze" or "cut off".
                 if (!isStreaming && lastFinishReason != null &&
-                    lastFinishReason in listOf("length-cap", "truncated", "stopped", "partial")
+                    lastFinishReason in listOf(
+                        "length-cap", "truncated", "stopped", "partial", "repetition"
+                    )
                 ) {
                     val capped = lastFinishReason == "length-cap" || lastFinishReason == "truncated"
                     Row(
@@ -358,10 +360,15 @@ fun ChatScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (capped)
-                                "Answer hit its token cap — open Response Tuning to raise it for this device"
-                            else
-                                "Generation was stopped early — tap to review the anti-hang limits",
+                            text = when (lastFinishReason) {
+                                "length-cap", "truncated" ->
+                                    "Answer hit its token cap — open Response Tuning to raise it for this device"
+                                "repetition" ->
+                                    "The model started repeating itself, so the answer was cut short — lower " +
+                                        "Temperature or Top-k in Response Tuning"
+                                else ->
+                                    "Generation was stopped early — tap to review the anti-hang limits"
+                            },
                             fontSize = 11.sp,
                             color = Slate300,
                             maxLines = 2,

@@ -63,7 +63,38 @@ and how each is implemented here:
 | Markdown re-parse cost | While tokens arrive, the bubble renders plain text; full Markdown parsing runs once at commit. Completed bubbles are memoised by `MarkdownParseCache`. |
 | OOM/thrash on low-RAM devices | `maxOutputTokens` and the prompt budget are clamped from measured free RAM and the model's KV-cache growth; attachment bodies are truncated to the context window (`PromptBudget.clampBody`). |
 
-## 4. On-device execution (the default)
+## 4. The CPU governor — the actual reason a phone freezes
+
+Reading the reference sources line by line (`inference_android.dart`, `chat_controller.dart`,
+`settings_view.dart`) shows the stall is **CPU saturation plus unbounded waits**, not simply
+"Compose repainting too often". Their controls, and what this app does about each:
+
+| Reference mechanism (file:line) | AgentLM |
+| --- | --- |
+| Thread table: GPU-fed → 4 threads; CPU-only → 6 / 5 / 4 / 3 by tier — **never all cores** (`inference_android.dart:104-128`) | `ResponsePolicy.resolvedThreads()` implements the same table, `BudgetAdvice.cpuThreads` suggests it, `applyDeviceAdvice()` writes it |
+| Google Tensor + Gemma → `threads = 1` (`inference_android.dart:124-128`) | `BudgetAdvice.singleThreadGuard` → `forceSingleThread` in `ChatViewModel.sendMessage` |
+| Settings sliders `maxTokens = 512`, `contextSize = 2048`, clamped per device (`settings_controller.dart:47-49`, `settings_view.dart:488`) | Response Tuning: token cap, context budget, history turns — each clamped by `ResponseBudgetAdvisor` |
+| `performanceMode == 'cpu_safe'` forces CPU (`inference_android.dart:184`) | `policy.gpuEnabled` switch + `fallbackGpuToCpu` retry |
+| explicit MB guard for the GPU path (`settings_view.dart:698-737`) | free RAM minus KV growth decides the resident budget; the new **"Cores reserved for the system"** slider is the CPU-side equivalent |
+| idle 5 s / prefill 60 s / hard 180 s (multimodal 8 / 90 / 240) (`inference_android.dart:394,410,418,496,514,520`) | `ResponseStreamer` applies three bounded waits, all configurable, and always commits the partial |
+| `stop()` bounded by `.timeout(800ms)`, buffer flushed first (`inference_android.dart:621-634`) | `stopGeneration()` only cancels and commits — native teardown never sits on the stop path |
+| `if (clean.isEmpty) return` + `hasVisibleOutput` gate (`inference_android.dart:383-386,480-486`) | `flush()` refuses to repaint a whitespace-only buffer, so an empty bubble never masquerades as a hang |
+| `repeatPenalty 1.1`, `minP 0.05`, `repeatLastN 64` (`inference_android.dart:352-360`) | `SamplerConfig` in litertlm 0.12 has no repeat knob, so `ResponseStreamer.repeatsBadly()` cuts the loop with `finishReason = "repetition"` and the hint points at Temperature / Top-k |
+| staged load progress 0.05 / 0.18 / 0.92 (`inference_android.dart:187-206`) | the Kotlin runtime exposes no load-progress channel, so `StreamingTelemetry` shows phase + elapsed time instead of inventing a percentage |
+
+**Enforcement, not advice.** A suggestion in a settings screen changes nothing if the runtime still
+spawns every core, so generation now runs on `InferenceThreads` — a fixed pool of exactly
+`resolvedThreads(...)` threads whose nice value is `THREAD_PRIORITY_BACKGROUND`. Linux children
+inherit the parent's nice value, so the native worker threads the engine creates from them are
+background-priority too: Android's input, render and SurfaceFlinger threads always win, which is
+what turns "the phone froze" into "the reply is slightly slower".
+
+Two main-thread hazards of our own were removed in the same pass: `engine.close()` on
+`Activity.onStop` and the 30 s idle-release tick both ran on Main; they now run on
+`Dispatchers.IO`, and ViewModel creation uses `HardwareInfo.probeLight()` so `/proc/meminfo` and
+`StatFs` are never read while the first frame is being drawn.
+
+## 5. On-device execution (the default)
 
 `agentlm.nativeEngine=true` is set in `gradle.properties`, so a normal build already contains the
 runtime that executes the downloaded weights on the phone. Opt out for a slim, server-only APK:
@@ -82,7 +113,7 @@ working through remote engines and says so plainly.
 
 For the GPU delegate the manifest already declares `libOpenCL.so` / `libvndksupport.so`.
 
-## 5. Files that matter
+## 6. Files that matter
 
 ```
 model/HardwareProbe.kt        measured RAM/SoC/Vulkan/thermal + budget advisor
@@ -98,15 +129,16 @@ ui/components/SettingsSheet.kt  Response Tuning + Engine & Keys tabs
 app/src/litertlm/…             opt-in LiteRT-LM backend
 ```
 
-## Verification
 
-CI runs `assembleDebug` (`.github/workflows/build.yml`). Locally: `gradle :app:compileDebugKotlin
-:app:compileDebugAndroidTestKotlin :app:testDebugUnitTest` — all green on this branch.
-
-## 5. Sampling ownership
+## 7. Sampling ownership
 
 `ResponsePolicy.temperature/topP/topK` use a negative value to mean "follow the persona", so
 `Personas` stays authoritative until the user deliberately overrides a slider in
 `Settings → Response Tuning`. The resolved numbers are attached to every `EngineRequest` and
 forwarded per request — Gemini `generationConfig.topK`, OpenAI-compatible `top_k` (only when it
 differs from 40, to stay compatible with strict endpoints) and LiteRT-LM `SamplerConfig`.
+
+## Verification
+
+CI runs `assembleDebug` (`.github/workflows/build.yml`). Locally: `gradle :app:compileDebugKotlin
+:app:compileDebugAndroidTestKotlin :app:testDebugUnitTest` — all green on this branch.

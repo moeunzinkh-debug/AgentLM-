@@ -94,7 +94,8 @@ class AiService(
         attachment: Attachment?,
         settings: RuntimeSettings,
         maxTokens: Int,
-        contextBudget: Int
+        contextBudget: Int,
+        cpuThreads: Int = 0
     ): Flow<GenEvent> = flow {
         val attempts = chain(settings, model)
         if (attempts.isEmpty()) {
@@ -110,7 +111,10 @@ class AiService(
             var done = false
             var failure: GenEvent.Failed? = null
 
-            streamReply(agent, model, history, userPrompt, attachment, settings, maxTokens, contextBudget, engine)
+            streamReply(
+                agent, model, history, userPrompt, attachment, settings,
+                maxTokens, contextBudget, engine, cpuThreads
+            )
                 .collect { event ->
                     when (event) {
                         is GenEvent.Delta -> {
@@ -175,7 +179,8 @@ class AiService(
         settings: RuntimeSettings,
         maxTokens: Int,
         contextBudget: Int,
-        engine: ChatEngine? = null
+        engine: ChatEngine? = null,
+        cpuThreads: Int = 0
     ): Flow<GenEvent> {
         val chosen = engine ?: engineFor(settings.activeEngine())
         val personaCap = minOf(agent.maxNewTokens, maxTokens)
@@ -222,6 +227,8 @@ class AiService(
             else agent.temperature.toDouble(),
             topP = if (policy.topP >= 0) policy.topP else agent.topP.toDouble(),
             topK = if (policy.topK > 0) policy.topK else 40,
+            cpuThreads = cpuThreads.coerceAtLeast(1),
+            lowPriorityInference = policy.lowPriorityInference,
             maxOutputTokens = personaCap.coerceAtLeast(96),
             contextTokenBudget = contextBudget,
             stopSequences = agent.stopSequences

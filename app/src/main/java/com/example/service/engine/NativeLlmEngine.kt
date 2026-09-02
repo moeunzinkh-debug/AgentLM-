@@ -207,7 +207,15 @@ class NativeLlmEngine(
                 )
             }
         }
-    }.flowOn(Dispatchers.IO)
+    }.flowOn(
+        // Bounded + background-priority: the engine's native worker threads are created from
+        // here, so they inherit both the cap and the nice value. See InferenceThreads.
+        InferenceThreads.contextFor(
+            threadCount = if (request.cpuThreads > 0) request.cpuThreads
+            else Runtime.getRuntime().availableProcessors() / 2,
+            lowPriority = request.policy.lowPriorityInference
+        )
+    )
 
     private suspend fun ensureSession(
         backend: NativeLlmBackend,
@@ -215,9 +223,12 @@ class NativeLlmEngine(
         path: String
     ): NativeSession {
         val useGpu = request.policy.gpuEnabled
-        val threads = request.policy.effectiveThreads(Runtime.getRuntime().availableProcessors())
+        val threads = if (request.cpuThreads > 0) request.cpuThreads
+        else request.policy.effectiveThreads(Runtime.getRuntime().availableProcessors())
         val contextBudget = request.contextTokenBudget.coerceAtLeast(512)
-        val key = "$path|$useGpu|$contextBudget"
+        // The thread budget belongs in the key: changing it must rebuild the session, otherwise
+        // "fewer cores" would only apply after a model switch and the phone keeps pegging all 8.
+        val key = "$path|$useGpu|$contextBudget|$threads"
 
         session?.let { existing ->
             if (sessionKey == key) {

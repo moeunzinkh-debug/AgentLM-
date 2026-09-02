@@ -71,7 +71,9 @@ The place that "defines the response": persona/system prompt per agent (`Persona
 * **Sampling** — temperature / top-p / top-k overrides (negative = follow the persona), sent per
   request so no weights reload is needed; on a phone a small candidate pool is what stops a 0.5B
   model from rambling past its cap into the repetition loops that look like a freeze;
-* **Anti-hang limits** — prefill, inter-token idle, hard turn cap, background release & keep-alive;
+* **CPU / RAM headroom** — how many cores inference may use (never all of them), how many stay
+  reserved for Android, and whether the generation threads run at background priority; plus prefill,
+  inter-token idle and hard turn caps, background release & keep-alive;
 * **Safety mode** — `Safe` (3–4 GB devices), `Balanced`, `Turbo` (flagships); each mode re-clamps tokens, cadence and Markdown policy.
 
 Everything persists in `SharedPreferences` as JSON (`RuntimeSettingsRepository`) and is clamped to

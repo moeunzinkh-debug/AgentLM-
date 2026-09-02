@@ -73,9 +73,23 @@ class ResponseStreamer {
         var failure: Outcome.Failed? = null
         val hardDeadline = stats.startedAt + policy.hardTimeoutSec * 1000L
 
+        fun hasPrintable(sb: StringBuilder): Boolean {
+            for (i in 0 until sb.length) {
+                if (!sb[i].isWhitespace()) return true
+            }
+            return false
+        }
+
         fun flush(force: Boolean) {
             val now = System.currentTimeMillis()
             val grew = acc.length - lastFlushLen
+            if (!hasPrintable(acc)) {
+                // Same gate as the reference engine loop (inference_android.dart:480-486): while
+                // the buffer is only whitespace there is nothing to show. Repainting an empty
+                // bubble is what makes a working phone *look* frozen, so keep the phase line
+                // ("prefilling…") instead until real characters arrive.
+                if (!force) return
+            }
             if (!force) {
                 if (now - lastFlushAt < policy.flushIntervalMs) return
                 if (grew < policy.minFlushChars && !finished) return
@@ -135,6 +149,16 @@ class ResponseStreamer {
                             acc.append(clean)
                             stats.tokensOut++
                             flush(false)
+                            // A quantised small model that locks into a loop keeps decoding until
+                            // the hard timeout — that is literally "the phone hangs for a while".
+                            // Cutting it at the second duplicate is far more useful than the loop.
+                            if (stats.tokensOut % 12 == 0 && repeatsBadly(acc)) {
+                                stats.finishReason = "repetition"
+                                stats.timedOut = "repetition"
+                                finished = true
+                                flush(true)
+                                break
+                            }
                         }
                     }
 
@@ -239,4 +263,42 @@ class ResponseStreamer {
             "<" + "|system|>"
         )
     }
+    /**
+     * Loop detector: compares the 40-character tail against equally sized blocks before it and
+     * gives up once the same block shows up a second time earlier in the answer.
+     */
+    private fun repeatsBadly(sb: StringBuilder): Boolean {
+        val len = sb.length
+        if (len < 240) return false
+        val block = 40
+        val tailStart = len - block
+        val prevStart = tailStart - block
+        // The overwhelmingly common loop is "the block just printed, again" - catching it needs
+        // no alignment assumption, and it is what actually saves minutes of pegged cores.
+        if (prevStart >= 0) {
+            var immediate = true
+            for (k in 0 until block) {
+                if (sb[prevStart + k] != sb[tailStart + k]) {
+                    immediate = false
+                    break
+                }
+            }
+            if (immediate) return true
+        }
+        var hits = 0
+        var i = 0
+        while (i + block <= tailStart) {
+            var same = true
+            for (k in 0 until block) {
+                if (sb[i + k] != sb[tailStart + k]) {
+                    same = false
+                    break
+                }
+            }
+            if (same) hits++
+            i += block
+        }
+        return hits >= 2
+    }
+
 }

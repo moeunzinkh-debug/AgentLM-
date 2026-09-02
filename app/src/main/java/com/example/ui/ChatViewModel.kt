@@ -74,7 +74,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _streamStats = MutableStateFlow<ResponseStreamer.Stats?>(null)
     val streamStats: StateFlow<ResponseStreamer.Stats?> = _streamStats.asStateFlow()
 
-    private val _hardware = MutableStateFlow(HardwareInfo.probe(app))
+    // Cheap first value so ViewModel creation never touches /proc or StatFs on the main thread;
+    // the full measurement follows on a worker dispatcher in init.
+    private val _hardware = MutableStateFlow(HardwareInfo.probeLight(app))
     val hardware: StateFlow<HardwareInfo> = _hardware.asStateFlow()
 
     private val _deviceSpecs = MutableStateFlow(ModelCatalog.deviceSpecsFrom(_hardware.value))
@@ -156,7 +158,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _runtimeSettings.collect { settings ->
                 _isGpuEnabled.value = settings.policy.gpuEnabled
-                _cpuThreads.value = settings.policy.effectiveThreads(_hardware.value.cores)
+                _cpuThreads.value = settings.policy.resolvedThreads(
+                    cores = _hardware.value.cores,
+                    usingGpu = settings.policy.gpuEnabled && _hardware.value.hasVulkanCompute,
+                    forceSingleThread = _budgetAdvice.value.singleThreadGuard
+                )
             }
         }
         viewModelScope.launch {
@@ -173,10 +179,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // --------------------------------------------------------- lifecycle helpers ----
 
     /** Called from MainActivity.onStop(): the UI is gone, so heavy idle state must go too. */
+    /**
+     * Called from `Activity.onStop`. Unmapping a loaded model releases real memory pressure but
+     * takes hundreds of milliseconds in native code — doing that here, on the main thread, is
+     * exactly the kind of "phone hangs when I leave the app" report to avoid at all costs.
+     */
     fun onEnterBackground() {
         val policy = _runtimeSettings.value.policy
         if (policy.releaseModelOnBackground && !_isStreaming.value) {
-            aiService.releaseNativeSession()
+            viewModelScope.launch(Dispatchers.IO) { aiService.releaseNativeSession() }
         }
     }
 
@@ -186,11 +197,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     /** Periodic idle-unload check (keep-alive window from Settings → Response Tuning). */
     private fun startIdleReleaseWatch() {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             while (true) {
                 delay(30_000)
                 if (_isStreaming.value) continue
                 val policy = _runtimeSettings.value.policy
+                // closeSession() is native teardown: it must never run on Main, or the idle
+                // release itself becomes the freeze it was meant to prevent.
                 aiService.maybeReleaseNative(policy.modelKeepAliveSec)
             }
         }
@@ -249,6 +262,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 contextTokenBudget = advice.contextTokenBudget,
                 historyTurnsOverride = advice.historyTurns,
                 cpuThreads = advice.cpuThreads,
+                cpuReserveCores = -1,
                 gpuEnabled = advice.gpuEnabled,
                 quantization = advice.quantization,
                 flushIntervalMs = ResponseBudgetAdvisor.flushIntervalMs(_hardware.value),
@@ -259,7 +273,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleGpu(enabled: Boolean) = updatePolicy { it.copy(gpuEnabled = enabled) }
 
-    fun setCpuThreads(threads: Int) = updatePolicy { it.copy(cpuThreads = threads.coerceIn(1, 16)) }
+    /** 0 = auto (device tier); the reference rule is never to use every core. */
+    fun setCpuThreads(threads: Int) = updatePolicy { it.copy(cpuThreads = threads.coerceIn(0, 16)) }
+
+    /** -1 = auto; otherwise how many cores stay free for Android while a reply is decoding. */
+    fun setCpuReserve(cores: Int) = updatePolicy { it.copy(cpuReserveCores = cores.coerceIn(-1, 7)) }
+
+    fun setLowPriorityInference(enabled: Boolean) =
+        updatePolicy { it.copy(lowPriorityInference = enabled) }
 
     fun setMaxTokens(tokens: Int) = updatePolicy { it.copy(maxOutputTokens = tokens.coerceIn(0, 4_096)) }
 
@@ -553,6 +574,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val advice = _budgetAdvice.value
         val maxTokens = policy.effectiveMaxTokens(advice.maxOutputTokens)
         val contextBudget = policy.effectiveContextBudget(advice.contextTokenBudget)
+        // CPU governor for this turn: bounded threads with the system core(s) kept free, and a
+        // single thread on the SoC/quant combinations that are known to race.
+        val inferenceThreadsCount = policy.resolvedThreads(
+            cores = _hardware.value.cores,
+            usingGpu = policy.gpuEnabled && _hardware.value.hasVulkanCompute,
+            forceSingleThread = advice.singleThreadGuard
+        )
 
         val messageContent = if (text.isNotEmpty()) text
         else if (attachment != null) "Please inspect and summarize ${attachment.name}"
@@ -598,7 +626,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 attachment = attachment,
                 settings = settings,
                 maxTokens = maxTokens,
-                contextBudget = contextBudget
+                contextBudget = contextBudget,
+                cpuThreads = inferenceThreadsCount
             )
 
             val outcome = try {

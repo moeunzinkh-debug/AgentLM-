@@ -1412,6 +1412,78 @@ private fun ResponseTuningTab(
 
         // ---- streaming cadence ----
         TuningCard(
+            title = "CPU / RAM headroom (the anti-freeze limit)",
+            subtitle = "The reference client never hands the model every core, and neither does this — " +
+                "the generation threads also run at background priority so input and drawing win."
+        ) {
+            val coresTotal = hardware.cores.coerceAtLeast(1)
+            val threadsNow = policy.resolvedThreads(
+                cores = coresTotal,
+                usingGpu = policy.gpuEnabled && hardware.hasVulkanCompute,
+                forceSingleThread = advice.singleThreadGuard
+            )
+            val freeCores = coresTotal - threadsNow
+            val share = 100 * threadsNow / coresTotal
+            InfoLine(
+                label = "Allowed this turn",
+                value = threadsNow.toString() + " of " + coresTotal + " cores  •  " + freeCores +
+                    " left for Android  •  ~" + share + "% of the SoC"
+            )
+            SliderRow(
+                label = "Inference threads",
+                valueText = if (policy.cpuThreads > 0) threadsNow.toString() + " (manual)"
+                else threadsNow.toString() + " (auto)",
+                value = threadsNow.toFloat(),
+                range = 1f..coresTotal.toFloat(),
+                onValue = { viewModel.setCpuThreads(it.toInt()) }
+            )
+            SliderRow(
+                label = "Cores reserved for the system",
+                valueText = if (policy.cpuReserveCores < 0) "auto (" + freeCores + ")"
+                else policy.cpuReserveCores.toString(),
+                value = (if (policy.cpuReserveCores < 0) freeCores else policy.cpuReserveCores)
+                    .toFloat().coerceIn(0f, 7f),
+                range = 0f..7f,
+                onValue = { viewModel.setCpuReserve(it.toInt()) }
+            )
+            SwitchRow(
+                label = "Background priority for inference",
+                desc = "The native runtime spawns its worker threads from these, so they inherit the " +
+                    "lower priority too. Decoding gets a bit slower; the phone never stops responding.",
+                checked = policy.lowPriorityInference,
+                onChange = { viewModel.setLowPriorityInference(it) }
+            )
+            Text(
+                text = "Why this matters: with every core busy decoding, Android's input, render and " +
+                    "SurfaceFlinger threads queue behind the model — that is the multi-second freeze, not " +
+                    "the keyboard. Google Tensor + Gemma is pinned to 1 thread automatically, because more " +
+                    "threads corrupt Q4 logits on those chips.",
+                fontSize = 10.sp,
+                color = Slate400,
+                lineHeight = 14.sp
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                MiniButton(
+                    label = "Auto (device tier)",
+                    accent = true,
+                    onClick = {
+                        viewModel.setCpuThreads(0)
+                        viewModel.setCpuReserve(-1)
+                    }
+                )
+                MiniButton(
+                    label = "Safest: 2 cores free",
+                    accent = false,
+                    onClick = {
+                        viewModel.setCpuThreads(0)
+                        viewModel.setCpuReserve(2)
+                    }
+                )
+            }
+        }
+
+        TuningCard(
             title = "Sampling (how the answer is chosen)",
             subtitle = "Sent with every request, so no weights reload is needed. Negative = follow the persona."
         ) {

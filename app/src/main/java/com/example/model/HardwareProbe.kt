@@ -62,6 +62,38 @@ data class HardwareInfo(
     companion object {
         private const val TAG = "HardwareProbe"
 
+        /**
+         * Main-thread-safe variant: only cached / trivial reads. Used for the ViewModel's initial
+         * value so creating the ViewModel cannot itself stall the first frame; [probe] follows on
+         * a worker dispatcher and replaces every field.
+         */
+        fun probeLight(context: Context): HardwareInfo {
+            val rt = Runtime.getRuntime()
+            val heapMb = rt.maxMemory() / 1_048_576L
+            val cores = rt.availableProcessors().coerceAtLeast(1)
+            val primary = Build.SUPPORTED_ABIS?.firstOrNull().orEmpty().ifBlank { "arm64-v8a" }
+            val hasVulkan = runCatching {
+                context.applicationContext.packageManager
+                    .hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL)
+            }.getOrDefault(false)
+            return HardwareInfo(
+                manufacturer = Build.MANUFACTURER ?: "unknown",
+                model = Build.MODEL ?: "unknown",
+                chipset = Build.HARDWARE ?: "unknown",
+                abi = primary,
+                is64Bit = primary.contains("64"),
+                cores = cores,
+                totalRamMb = if (heapMb > 0) (heapMb * 3).coerceAtLeast(1) else 4_096L,
+                availRamMb = if (heapMb > 0) (heapMb * 2).coerceAtLeast(1) else 2_048L,
+                appHeapMb = heapMb,
+                freeDiskMb = 0L,
+                vulkanComputeLevel = if (hasVulkan) 1 else 0,
+                hasVulkan = hasVulkan,
+                powerSaveMode = false,
+                thermalStatus = 0
+            )
+        }
+
         fun probe(context: Context): HardwareInfo {
             val app = context.applicationContext
             val rt = Runtime.getRuntime()
@@ -243,12 +275,14 @@ object ResponseBudgetAdvisor {
             warnings += "No usable Vulkan compute backend detected — running on CPU (${hardware.cores} threads max)."
         }
 
-        val threads = when {
-            hardware.cores >= 8 -> 6
+        // Reference rule (inference_android.dart:104-128) + one core always kept for the system.
+        val maxCpu = (hardware.cores - 1).coerceAtLeast(1)
+        val threads = (when {
+            hardware.cores >= 10 -> 6
+            hardware.cores >= 8 -> 5
             hardware.cores >= 6 -> 4
-            hardware.cores >= 4 -> 3
-            else -> 2
-        }
+            else -> 3
+        }.let { if (useGpu) it.coerceAtMost(4) else it }).coerceAtMost(maxCpu)
         val singleThreadGuard = hardware.isTensorSoC &&
             (model?.id?.lowercase()?.contains("gemma") == true ||
                 model?.name?.lowercase()?.contains("gemma") == true)
@@ -274,7 +308,7 @@ object ResponseBudgetAdvisor {
             maxOutputTokens = maxOutput,
             contextTokenBudget = contextBudget,
             historyTurns = turns,
-            cpuThreads = if (useGpu) threads else (threads + 1).coerceAtMost(hardware.cores),
+            cpuThreads = if (singleThreadGuard) 1 else threads.coerceAtMost(maxCpu),
             gpuEnabled = useGpu,
             singleThreadGuard = singleThreadGuard,
             quantization = quant,
