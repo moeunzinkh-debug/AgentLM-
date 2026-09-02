@@ -63,7 +63,8 @@ jobs:
           {
             echo "### CI Debug build log for ${GITHUB_SHA}"
             echo '```'
-            tail -c 45000 build.log
+            # Skip the huge Java stack trace, keep the meaningful part.
+            awk '/^\* Exception is:/{exit} {print}' build.log | tail -c 20000
             echo '```'
           } > report.md
           jq -Rs '{body: .}' report.md > payload.json

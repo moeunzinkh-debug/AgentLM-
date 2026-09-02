@@ -45,11 +45,11 @@ android {
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       signingConfig = signingConfigs.getByName("release")
-      buildConfigField("String", "GEMINI_API_KEY", '""')
+      buildConfigField("String", "GEMINI_API_KEY", "\"\"")
     }
     debug {
       signingConfig = signingConfigs.getByName("debugConfig")
-      buildConfigField("String", "GEMINI_API_KEY", '""')
+      buildConfigField("String", "GEMINI_API_KEY", "\"\"")
     }
   }
   compileOptions {
