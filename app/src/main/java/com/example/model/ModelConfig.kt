@@ -322,9 +322,9 @@ object ModelCatalog {
             else -> PRESET_MODELS.firstOrNull { it.sizeBytes <= 400_000_000L }?.id ?: DEFAULT_MODEL.id
         }
         val renderer = when {
-            !hardware.hasVulkan -> "CPU only (no Vulkan device found)"
-            hardware.vulkanComputeLevel >= 42 -> "Vulkan ${hardware.vulkanComputeLevel} compute-capable GPU"
-            else -> "Vulkan ${hardware.vulkanComputeLevel} (limited compute — CPU preferred)"
+            hardware.hasVulkanCompute -> "Vulkan compute-capable GPU (delegate available)"
+            hardware.hasVulkan -> "Vulkan present without advertised compute level — CPU preferred"
+            else -> "CPU only (no Vulkan device found)"
         }
         val reason = buildString {
             append("${hardware.manufacturer} ${hardware.model} • ${hardware.chipset} • ")
@@ -334,11 +334,11 @@ object ModelCatalog {
             append(". ").append(when (tier) {
                 "high" -> "Can hold a 1-2B Q4 model with a multi-turn KV cache without swapping."
                 "low" -> "Keep answers short and prefer sub-400MB weights to avoid UI stalls."
-                else -> "Best served by a sub-1B Q4 model with clamped output length."
+                else -> "Comfortable with a ~0.5–1.5B Q4 model; keep output clamped to a few hundred tokens."
             })
         }
         return DeviceSpecs(
-            hasHardwareGpu = hardware.vulkanComputeLevel >= 42,
+            hasHardwareGpu = hardware.hasVulkanCompute,
             chipset = hardware.chipset,
             deviceModel = "${hardware.manufacturer} ${hardware.model}",
             deviceAbis = listOf(hardware.abi),

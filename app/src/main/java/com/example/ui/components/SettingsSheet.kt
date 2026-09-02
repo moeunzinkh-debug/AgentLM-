@@ -632,12 +632,12 @@ private fun GpuCpuTab(
                 Spacer(modifier = Modifier.height(3.dp))
                 Text(
                     text = when {
-                        isGpuEnabled && hardware.vulkanComputeLevel >= 42 ->
-                            "Vulkan compute level ${hardware.vulkanComputeLevel} detected — GPU delegate requested, " +
+                        isGpuEnabled && hardware.hasVulkanCompute ->
+                            "Vulkan compute support advertised by the driver — GPU delegate requested, " +
                                 "with automatic retry on CPU if the driver refuses."
                         isGpuEnabled ->
-                            "No full Vulkan compute device found (level ${hardware.vulkanComputeLevel}) — " +
-                                "GPU requests will fall back to CPU on this SoC anyway."
+                            "No Vulkan compute level advertised by this driver — " +
+                                "the runtime will retry on CPU, which is often faster on mid-range SoCs."
                         else -> "CPU execution only (${hardware.cores} logical cores available)."
                     },
                     fontSize = 11.sp,

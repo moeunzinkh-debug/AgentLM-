@@ -33,6 +33,13 @@ data class HardwareInfo(
     val totalRamGb: Int get() = (totalRamMb / 1024.0).toInt().coerceAtLeast(1)
     val availRamGb: Int get() = (availRamMb / 1024.0).toInt().coerceAtLeast(1)
 
+    /**
+     * True when the platform declares Vulkan hardware-level support, i.e. a driver that can run
+     * compute shaders (CTS requires Vulkan 1.1 compute for this feature). The LiteRT-LM GPU
+     * delegate is only worth requesting when this holds; otherwise CPU is genuinely faster.
+     */
+    val hasVulkanCompute: Boolean get() = hasVulkan && vulkanComputeLevel > 0
+
     /** True when the SoC is one of the Google Tensor parts with known quant races. */
     val isTensorSoC: Boolean
         get() = chipset.contains("tensor", ignoreCase = true) ||
@@ -229,8 +236,7 @@ object ResponseBudgetAdvisor {
             else -> 8
         }
 
-        val useGpu = hardware.hasVulkan &&
-            hardware.vulkanComputeLevel >= 42 &&
+        val useGpu = hardware.hasVulkanCompute &&
             hardware.is64Bit &&
             !hardware.powerSaveMode
         if (!useGpu && model != null) {
