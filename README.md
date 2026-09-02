@@ -86,7 +86,10 @@ the same class can also be wired into a Flutter/other host, which is how the ref
 
 ```bash
 ./gradlew :app:assembleDebug
-./gradlew :app:testDebugUnitTest      # Robolectric screenshot test on the new ViewModel ctor
+./gradlew :app:testDebugUnitTest      # Robolectric: constructs ChatViewModel + renders the greeting
 ```
+
+Verified in CI on this branch: `:app:compileDebugKotlin`, `:app:compileDebugAndroidTestKotlin` and
+`:app:testDebugUnitTest` all pass, and the `Build APK` workflow produces `app-debug.apk`.
 
 Requirements: JDK 17, Android SDK 36 (compileSdk `36.1`), Kotlin 2.2.10, AGP 9.1.1.

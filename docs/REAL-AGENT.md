@@ -96,3 +96,8 @@ ui/ChatScreen.kt               follow-only autoscroll, plain-text streaming bubb
 ui/components/SettingsSheet.kt  Response Tuning + Engine & Keys tabs
 app/src/litertlm/…             opt-in LiteRT-LM backend
 ```
+
+## Verification
+
+CI runs `assembleDebug` (`.github/workflows/build.yml`). Locally: `gradle :app:compileDebugKotlin
+:app:compileDebugAndroidTestKotlin :app:testDebugUnitTest` — all green on this branch.
