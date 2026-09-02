@@ -8,7 +8,13 @@ data class Agent(
     val systemPrompt: String,
     val temperature: Float = 0.7f,
     val topP: Float = 0.9f,
-    val maxNewTokens: Int = 512
+    val maxNewTokens: Int = 512,
+    /** How many previous turns the persona wants in context (still clamped by device RAM). */
+    val historyTurns: Int = 6,
+    /** Sequences that end generation early (e.g. stop at the next role marker). */
+    val stopSequences: List<String> = emptyList(),
+    /** Style guardrails injected into the system prompt. */
+    val bannedPhrases: List<String> = emptyList()
 )
 
 object AgentCatalog {
@@ -31,7 +37,8 @@ object AgentCatalog {
             systemPrompt = "You are an expert software engineer. You write clean, well-commented code and explain your reasoning. When asked for code, prefer modern idioms, include short usage examples, and call out edge cases. Format code in fenced blocks with the correct language tag.",
             temperature = 0.4f,
             topP = 0.9f,
-            maxNewTokens = 768
+            maxNewTokens = 768,
+            historyTurns = 8
         ),
         Agent(
             id = "writer",
@@ -51,7 +58,8 @@ object AgentCatalog {
             systemPrompt = "You are a precise, analytical assistant. You think step by step, break complex questions into smaller parts, and present conclusions with clear reasoning. Use bullet points, tables, and short paragraphs for clarity.",
             temperature = 0.3f,
             topP = 0.85f,
-            maxNewTokens = 600
+            maxNewTokens = 600,
+            historyTurns = 8
         ),
         Agent(
             id = "uncensored",
@@ -71,7 +79,8 @@ object AgentCatalog {
             systemPrompt = "You are a patient tutor. You explain concepts at the user's level, use simple analogies, and check understanding. Avoid jargon unless you define it. Encourage follow-up questions.",
             temperature = 0.6f,
             topP = 0.9f,
-            maxNewTokens = 600
+            maxNewTokens = 600,
+            bannedPhrases = listOf("As an AI language model", "It's important to note")
         )
     )
 

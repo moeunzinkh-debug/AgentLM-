@@ -3,374 +3,323 @@ package com.example.service
 import com.example.model.Agent
 import com.example.model.Attachment
 import com.example.model.ChatMessage
+import com.example.model.EngineKind
+import com.example.model.EngineProfile
 import com.example.model.HFModelConfig
 import com.example.model.MessageRole
-import com.example.model.ModelType
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import com.example.model.ResponsePolicy
+import com.example.model.RuntimeSettings
+import com.example.service.engine.ChatEngine
+import com.example.service.engine.ChatTurn
+import com.example.service.engine.EngineRequest
+import com.example.service.engine.GeminiEngine
+import com.example.service.engine.GenEvent
+import com.example.service.engine.NativeLlmEngine
+import com.example.service.engine.OpenAiCompatEngine
+import com.example.service.engine.PromptBudget
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
+import java.io.File
 
-class AiService {
+/**
+ * Chooses the engine that will answer, builds a RAM-bounded prompt from the conversation, and
+ * streams the model's real tokens.
+ *
+ * There is deliberately **no canned-response path**: if no engine can answer, the user gets a
+ * precise error plus a fix suggestion instead of text that was written at build time.
+ */
+class AiService(
+    private val downloads: ModelDownloadManager,
+    private val cacheRoot: File
+) {
 
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .build()
+    fun engineFor(profile: EngineProfile): ChatEngine = when (profile.kind) {
+        EngineKind.LOCAL_NATIVE -> nativeEngine
+        EngineKind.GEMINI -> GeminiEngine(profile.id, profile.label, profile)
+        EngineKind.OPENAI_COMPAT -> OpenAiCompatEngine(
+            id = profile.id,
+            label = profile.label,
+            baseUrl = profile.baseUrl,
+            apiKey = profile.apiKey.ifBlank { null },
+            modelId = profile.modelId.ifBlank { "default" }
+        )
+    }
+
+    /** One shared native engine so the loaded weights survive across turns. */
+    private val nativeEngine: NativeLlmEngine by lazy {
+        NativeLlmEngine(cacheDirProvider = { cacheDir().absolutePath })
+    }
+
+    private fun cacheDir(): File = cacheRoot.apply { if (!exists()) mkdirs() }
+
+    /** Frees multi-hundred-MB of mapped weights (idle unload / app backgrounded). */
+    fun releaseNativeSession() {
+        nativeEngine.closeSession()
+    }
+
+    fun nativeSessionOpen(): Boolean = nativeEngine.isSessionOpen()
+
+    /** Idle unload: gives the mapped weights back so the OS has RAM for the next foreground frame. */
+    fun maybeReleaseNative(keepAliveSec: Int): Boolean = nativeEngine.maybeRelease(keepAliveSec)
+
+    /** Engines worth trying, in order: the selected one, then the on-device one, then the rest. */
+    fun chain(settings: RuntimeSettings, model: HFModelConfig): List<Pair<EngineProfile, ChatEngine>> {
+        val ready = settings.engines.filter { it.isReady }
+        val active = settings.activeEngine().let { a -> if (a.isReady) a else null }
+        val ordered = ArrayList<EngineProfile>()
+        active?.let { ordered.add(it) }
+        val local = ready.firstOrNull { it.kind == EngineKind.LOCAL_NATIVE }
+        if (local != null && downloads.isDownloaded(model.id) && ordered.none { it.id == local.id }) {
+            ordered.add(local)
+        }
+        ready.forEach { if (!ordered.contains(it)) ordered.add(it) }
+
+        return ordered
+            .map { profile -> profile to engineFor(profile) }
+            .filter { (_, engine) -> engine.isUsable() }
+    }
+
+    /**
+     * Streams with automatic engine fallback. A failing engine is only replaced while nothing
+     * has been shown yet — never mid-sentence, which would produce a spliced answer.
+     */
+    fun streamWithFallback(
+        agent: Agent,
+        model: HFModelConfig,
+        history: List<ChatMessage>,
+        userPrompt: String,
+        attachment: Attachment?,
+        settings: RuntimeSettings,
+        maxTokens: Int,
+        contextBudget: Int,
+        cpuThreads: Int = 0
+    ): Flow<GenEvent> = flow {
+        val attempts = chain(settings, model)
+        if (attempts.isEmpty()) {
+            emit(noEngineFailure(settings))
+            return@flow
+        }
+
+        var emittedAnything = false
+        var lastFailure: GenEvent.Failed? = null
+
+        for ((index, attempt) in attempts.withIndex()) {
+            val (profile, engine) = attempt
+            var done = false
+            var failure: GenEvent.Failed? = null
+
+            streamReply(
+                agent, model, history, userPrompt, attachment, settings,
+                maxTokens, contextBudget, engine, cpuThreads
+            )
+                .collect { event ->
+                    when (event) {
+                        is GenEvent.Delta -> {
+                            emittedAnything = true
+                            emit(event)
+                        }
+                        is GenEvent.Progress -> if (!emittedAnything) {
+                            emit(GenEvent.Progress("${engine.id}:${event.phase}", event.elapsedMs))
+                        } else {
+                            emit(event)
+                        }
+                        is GenEvent.Done -> {
+                            done = true
+                            emit(event)
+                        }
+                        is GenEvent.Failed -> {
+                            failure = event
+                            if (emittedAnything) emit(event)
+                        }
+                    }
+                }
+
+            if (done || emittedAnything) return@flow
+            lastFailure = failure ?: lastFailure
+
+            if (index < attempts.size - 1) {
+                emit(
+                    GenEvent.Progress(
+                        "fallback:${attempts[index + 1].first.label}",
+                        0
+                    )
+                )
+            }
+        }
+
+        emit(lastFailure ?: noEngineFailure(settings))
+    }.flowOn(Dispatchers.IO)
+
+    private fun noEngineFailure(settings: RuntimeSettings): GenEvent.Failed {
+        val active = settings.activeEngine()
+        return GenEvent.Failed(
+            message = when (active.kind) {
+                EngineKind.LOCAL_NATIVE ->
+                    "On-device engine selected, but no runtime/weights are usable in this build."
+                EngineKind.GEMINI -> "Gemini is selected but no API key is configured."
+                EngineKind.OPENAI_COMPAT -> "No reachable inference endpoint is configured."
+            },
+            hint = "Offline first: open Model Hub, download a quantization that fits this phone's RAM " +
+                "and press \u201cUse offline\u201d — the weights then run on the device with no key at all. " +
+                "Alternatively point Settings → Engines & Keys at Ollama / llama-server / LM Studio, or " +
+                "add a Gemini key. AgentLM never fabricates a reply when no model can answer.",
+            recoverable = true
+        )
+    }
 
     fun streamReply(
         agent: Agent,
         model: HFModelConfig,
         history: List<ChatMessage>,
         userPrompt: String,
-        attachment: Attachment? = null
-    ): Flow<String> = flow {
-        // Get API key from environment variable first (for runtime configuration)
-        // Then try BuildConfig as fallback (for build-time configuration)
-        val apiKey = System.getenv("GEMINI_API_KEY")?.trim() ?: ""
+        attachment: Attachment?,
+        settings: RuntimeSettings,
+        maxTokens: Int,
+        contextBudget: Int,
+        engine: ChatEngine? = null,
+        cpuThreads: Int = 0
+    ): Flow<GenEvent> {
+        val chosen = engine ?: engineFor(settings.activeEngine())
+        val personaCap = minOf(agent.maxNewTokens, maxTokens)
+        val localPath = if (chosen is NativeLlmEngine) downloads.localPathFor(model.id) else null
 
-        val hasValidApiKey = apiKey.isNotEmpty() && !apiKey.contains("MY_GEMINI_API_KEY")
+        val policy = settings.policy
+        val trimmed = PromptBudget.fit(
+            history = history,
+            currentText = userPrompt,
+            systemPrompt = agent.systemPrompt,
+            contextTokenBudget = contextBudget,
+            maxTurns = policy.effectiveHistoryTurns(agent.historyTurns)
+        )
 
-        if (hasValidApiKey) {
-            var fullResponse = ""
-            var apiSucceeded = false
-            try {
-                fullResponse = callGeminiRest(apiKey, agent, history, userPrompt, attachment)
-                if (fullResponse.isNotBlank()) {
-                    apiSucceeded = true
-                }
-            } catch (e: Exception) {
-                apiSucceeded = false
-            }
-
-            if (apiSucceeded) {
-                // Stream chunks for responsive UI
-                val words = fullResponse.split(" ")
-                val chunkBuilder = StringBuilder()
-                for (i in words.indices) {
-                    chunkBuilder.append(words[i])
-                    if (i < words.size - 1) chunkBuilder.append(" ")
-                    emit(chunkBuilder.toString())
-                    delay(20)
-                }
-                return@flow
-            }
+        val turns = ArrayList<ChatTurn>()
+        for (msg in trimmed) {
+            if (msg.content.isBlank()) continue
+            turns.add(ChatTurn(msg.role, msg.content))
         }
 
-        // Local Smart AI Response Generation according to persona, model, and attached files
-        val simulatedText = generatePersonaResponse(agent, model, userPrompt, attachment)
-        val tokens = simulatedText.split(Regex("(?<=\\s)|(?<=\\n)"))
-        val accumulator = StringBuilder()
+        val promptText = buildPromptText(userPrompt, attachment, contextBudget)
+        turns.add(ChatTurn(MessageRole.USER, promptText))
 
-        for (token in tokens) {
-            accumulator.append(token)
-            emit(accumulator.toString())
-            delay(15)
-        }
-    }.flowOn(Dispatchers.IO)
-
-    private fun callGeminiRest(
-        apiKey: String,
-        agent: Agent,
-        history: List<ChatMessage>,
-        userPrompt: String,
-        attachment: Attachment?
-    ): String {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
-        
-        val contentsArray = JSONArray()
-        
-        // Add conversation history
-        val recentHistory = history.takeLast(8)
-        for (msg in recentHistory) {
-            if (msg.content.isNotBlank()) {
-                val roleStr = if (msg.role == MessageRole.USER) "user" else "model"
-                val partObj = JSONObject().put("text", msg.content)
-                val msgObj = JSONObject()
-                    .put("role", roleStr)
-                    .put("parts", JSONArray().put(partObj))
-                contentsArray.put(msgObj)
-            }
-        }
-
-        // Add current prompt and attachments
-        val currentMsgParts = JSONArray()
-
-        if (attachment != null) {
-            if (attachment.isImage && !attachment.base64Data.isNullOrBlank()) {
-                val inlineDataObj = JSONObject()
-                    .put("mime_type", if (attachment.mimeType.isNotBlank()) attachment.mimeType else "image/jpeg")
-                    .put("data", attachment.base64Data)
-                val imagePart = JSONObject().put("inline_data", inlineDataObj)
-                currentMsgParts.put(imagePart)
-            } else if (!attachment.extractedText.isNullOrBlank()) {
-                val fileContext = "=== ATTACHED FILE: ${attachment.name} (${attachment.formattedSize}) ===\n" +
-                        attachment.extractedText + "\n=== END ATTACHED FILE ===\n\n"
-                currentMsgParts.put(JSONObject().put("text", fileContext))
-            }
-        }
-
-        val promptText = if (userPrompt.isNotBlank()) userPrompt else if (attachment != null) "Please analyze and summarize the attached file." else "Hello"
-        currentMsgParts.put(JSONObject().put("text", promptText))
-
-        val currentMsg = JSONObject()
-            .put("role", "user")
-            .put("parts", currentMsgParts)
-        contentsArray.put(currentMsg)
-
-        val systemInstructionObj = JSONObject()
-            .put("parts", JSONArray().put(JSONObject().put("text", agent.systemPrompt)))
-
-        val genConfigObj = JSONObject()
-            .put("temperature", agent.temperature.toDouble())
-            .put("topP", agent.topP.toDouble())
-            .put("maxOutputTokens", agent.maxNewTokens)
-
-        val requestBodyJson = JSONObject()
-            .put("contents", contentsArray)
-            .put("systemInstruction", systemInstructionObj)
-            .put("generationConfig", genConfigObj)
-
-        val body = requestBodyJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-        val request = Request.Builder()
-            .url(url)
-            .post(body)
-            .build()
-
-        val response = httpClient.newCall(request).execute()
-        val responseBody = response.body?.string() ?: throw RuntimeException("Empty response body")
-
-        if (!response.isSuccessful) {
-            throw RuntimeException("API error: ${response.code} $responseBody")
-        }
-
-        val json = JSONObject(responseBody)
-        val candidates = json.optJSONArray("candidates")
-        if (candidates != null && candidates.length() > 0) {
-            val first = candidates.getJSONObject(0)
-            val content = first.optJSONObject("content")
-            val parts = content?.optJSONArray("parts")
-            if (parts != null && parts.length() > 0) {
-                val text = parts.getJSONObject(0).optString("text", "")
-                if (text.isNotEmpty()) return text
-            }
-        }
-        throw RuntimeException("Could not parse candidates from Gemini API")
-    }
-
-    private fun generatePersonaResponse(
-        agent: Agent,
-        model: HFModelConfig,
-        userPrompt: String,
-        attachment: Attachment?
-    ): String {
-        // Handle file attachments directly
-        if (attachment != null) {
-            if (attachment.isZip) {
-                return generateZipAnalysis(agent, model, attachment, userPrompt)
-            }
-            if (attachment.isImage) {
-                return generateImageAnalysis(agent, model, attachment, userPrompt)
-            }
-            if (attachment.isCodeOrText) {
-                return generateCodeOrTextAnalysis(agent, model, attachment, userPrompt)
-            }
-        }
-
-        val lower = userPrompt.lowercase().trim()
-
-        if (lower.contains("hello") || lower.contains("hi") || lower.contains("សួស្តី")) {
-            return "👋 Hello! I am **${agent.name}** running on **${model.name}**.\n\n" +
-                    "I'm ready to assist you with reasoning, code generation, creative writing, file reading, and data analysis. What would you like to work on today?"
-        }
-
-        if (lower.contains("help") || lower.contains("what can you do")) {
-            val visionText = if (model.supportsVision) "  * 🖼️ Multimodal Vision & OCR (Images, screenshots, charts)\n" else ""
-            val filesText = if (model.supportsFiles) "  * 📦 File Inspector (ZIP archives, Kotlin/Python/JS code, markdown)\n" else ""
-            return "### 🚀 Capabilities of ${agent.name}\n\n" +
-                    "- **Active Persona:** ${agent.name} (${agent.emoji})\n" +
-                    "- **Active Model:** `${model.id}` (${model.size})\n" +
-                    "- **Key Features:**\n" +
-                    "  * ⚡ Multi-turn contextual chat\n" +
-                    visionText +
-                    filesText +
-                    "  * 💻 Full code syntax & formatting in Kotlin, Python, TypeScript, etc.\n" +
-                    "  * 📊 Analytical breakdowns and step-by-step reasoning\n" +
-                    "  * 🌐 Fast Hugging Face ONNX & Gemini AI acceleration\n\n" +
-                    "Feel free to ask a question, attach a file/image, or request code!"
-        }
-
-        if (lower.contains("webgpu") || lower.contains("how") && lower.contains("work")) {
-            return "### ⚡ How In-Browser & Local AI Works\n\n" +
-                    "1. **ONNX Runtime & WebGPU/Vulkan Acceleration:**\n" +
-                    "   * Model weights (e.g., Qwen 2.5, SmolLM2) are quantized to `Q4` format to reduce footprint under 350MB.\n" +
-                    "   * Matrix multiplications are dispatched directly to local GPU compute shaders for low-latency token generation.\n\n" +
-                    "2. **Privacy & Offline First:**\n" +
-                    "   * Model inferences run locally without transmitting chat logs to third-party telemetry servers.\n\n" +
-                    "3. **Cloud Gemini API Fallback:**\n" +
-                    "   * When configured, the app seamlessly connects to Google Gemini 2.5 Flash for high-parameter reasoning."
-        }
-
-        if (model.type == ModelType.UNCENSORED || model.id.lowercase().contains("dolphin")) {
-            return "### 🐬 ${model.name} (Uncensored / Open Output)\n\n" +
-                    "**Direct & Unrestricted Response for:** *\"$userPrompt\"*\n\n" +
-                    "1. **Analysis & Direct Findings:**\n" +
-                    "   - Executing query with zero refusal filters and unrestrained parameter freedom.\n" +
-                    "   - Full contextual depth provided without artificial guardrails, disclaimers, or omissions.\n\n" +
-                    "2. **Core Technical Breakdown:**\n" +
-                    "   - The requested information has been synthesized thoroughly according to your prompt specifications.\n" +
-                    "   - Open weights fine-tuning ensures high alignment with raw technical queries and creative freedom."
-        }
-
-        return when (agent.id) {
-            "coder" -> {
-                "Here is a clean, modern implementation for your request:\n\n" +
-                "```kotlin\n" +
-                "// Generated by ${model.name} (${agent.name})\n" +
-                "fun processRequest(input: String): String {\n" +
-                "    val sanitized = input.trim()\n" +
-                "    return \"Result for: \" + sanitized + \" (Timestamp: \" + System.currentTimeMillis() + \")\"\n" +
-                "}\n" +
-                "```\n\n" +
-                "**Key Highlights:**\n" +
-                "- Concise and memory-safe execution\n" +
-                "- Handles edge cases with zero external dependencies\n" +
-                "- Ready for seamless integration into your project."
-            }
-            "analyst" -> {
-                "### 📊 Analytical Breakdown\n\n" +
-                "**1. Core Assessment:**\n" +
-                "Evaluating your query: *\"$userPrompt\"*\n\n" +
-                "**2. Key Factors:**\n" +
-                "- **Primary Objective:** High accuracy and practical feasibility.\n" +
-                "- **Performance Impact:** Optimized for low latency and minimal resource overhead.\n" +
-                "- **Scalability:** Adaptable across both local embedded environments and cloud APIs.\n\n" +
-                "**3. Conclusion & Next Steps:**\n" +
-                "Proceed with modular implementation and benchmark token throughput."
-            }
-            "writer" -> {
-                "The digital landscape glowed with a soft indigo twilight as the neural pathways aligned. " +
-                "Every token flowed seamlessly across the interface, bridging the gap between thought and creation.\n\n" +
-                "In this space powered by **${model.name}**, imagination and computation meet in harmony, " +
-                "turning ideas into vivid reality with effortless precision."
-            }
-            "uncensored" -> {
-                "Direct response for: **$userPrompt**\n\n" +
-                "Here is the unfiltered, neutral breakdown with complete technical and descriptive depth. " +
-                "All parameters and underlying considerations have been analyzed without artificial omissions or preambles."
-            }
-            "tutor" -> {
-                "### 🎓 Understanding: $userPrompt\n\n" +
-                "Let's break this down with a simple analogy:\n\n" +
-                "Think of an AI model like a vast library indexed by semantic connections. When you ask a question, " +
-                "the model finds the most relevant pathways and constructs a tailored response step by step.\n\n" +
-                "**Key Takeaways:**\n" +
-                "1. **Concept:** Everything is represented as mathematical vectors.\n" +
-                "2. **Process:** Attention mechanisms focus on the most important context.\n" +
-                "3. **Result:** Clear, structured output.\n\n" +
-                "Does this make sense, or would you like to explore an example?"
-            }
-            else -> {
-                "I have processed your request: **$userPrompt**.\n\n" +
-                "Using **${model.name}** under the **${agent.name}** persona, here is the solution:\n\n" +
-                "- **Context:** Structured for clear execution.\n" +
-                "- **Accuracy:** High fidelity with optimized parameters.\n\n" +
-                "Let me know if you would like me to elaborate or adjust the response!"
-            }
-        }
-    }
-
-    private fun generateZipAnalysis(
-        agent: Agent,
-        model: HFModelConfig,
-        attachment: Attachment,
-        userPrompt: String
-    ): String {
-        val totalFiles = attachment.zipEntries.size
-        val readableFiles = attachment.zipEntries.filter { it.isReadable }
-        val binaryFiles = attachment.zipEntries.filter { !it.isReadable }
-
-        val sb = StringBuilder()
-        sb.append("### 📦 ZIP Archive Inspection: `${attachment.name}`\n\n")
-        sb.append("- **Archive Name:** `${attachment.name}`\n")
-        sb.append("- **Size:** ${attachment.formattedSize}\n")
-        sb.append("- **Total Entries:** $totalFiles files (${readableFiles.size} text/code, ${binaryFiles.size} binary)\n\n")
-
-        sb.append("#### 📂 Opened & Read Files:\n")
-        if (readableFiles.isEmpty()) {
-            sb.append("*No text or source code files could be extracted.*\n\n")
+        // Vision input is only forwarded when the selected weights advertise vision support, so a
+        // text-only model never receives a huge base64 blob it will choke on.
+        val imageData: String? = if (attachment != null && attachment.isImage &&
+            (model.supportsVision || chosen is NativeLlmEngine)
+        ) {
+            attachment.base64Data?.takeIf { it.isNotBlank() }
         } else {
-            for (f in readableFiles.take(8)) {
-                sb.append("- **`${f.name}`** (${f.sizeBytes} B)\n")
-                if (!f.previewSnippet.isNullOrBlank()) {
-                    val preview = f.previewSnippet.take(160).replace("\n", "\n  ")
-                    sb.append("  ```\n  $preview\n  ```\n")
+            null
+        }
+
+        val request = EngineRequest(
+            systemPrompt = buildSystemPrompt(agent, model, localPath != null),
+            turns = turns,
+            policy = policy,
+            modelId = settings.activeEngine().modelId.ifBlank { model.id },
+            localModelPath = localPath,
+            contextNote = null,
+            imageBase64 = imageData,
+            imageMime = attachment?.mimeType?.takeIf { it.isNotBlank() } ?: "image/jpeg",
+            temperature = if (policy.temperature >= 0) policy.temperature
+            else agent.temperature.toDouble(),
+            topP = if (policy.topP >= 0) policy.topP else agent.topP.toDouble(),
+            topK = if (policy.topK > 0) policy.topK else 40,
+            cpuThreads = cpuThreads.coerceAtLeast(1),
+            lowPriorityInference = policy.lowPriorityInference,
+            maxOutputTokens = personaCap.coerceAtLeast(96),
+            contextTokenBudget = contextBudget,
+            stopSequences = agent.stopSequences
+        )
+        return chosen.stream(request)
+    }
+
+    private fun buildPromptText(
+        userPrompt: String,
+        attachment: Attachment?,
+        contextBudget: Int
+    ): String {
+        if (attachment == null) return userPrompt.ifBlank { "Hello" }
+
+        // Attaching a whole repo is the classic way to freeze on-device inference: the prefill
+        // blows past the context window and the model burns minutes tokenizing. Cap it hard.
+        val bodyBudget = (contextBudget * 2).coerceIn(600, 6_000)
+        val parts = ArrayList<String>()
+        if (userPrompt.isNotBlank()) parts.add(userPrompt)
+
+        when {
+            attachment.isZip -> {
+                val sb = StringBuilder()
+                sb.append("(Attached archive: ${attachment.name}, ${attachment.formattedSize}, ")
+                sb.append("${attachment.zipEntries.size} entries)\n")
+                for (entry in attachment.zipEntries.take(40)) {
+                    if (entry.isDirectory) continue
+                    sb.append("- ${entry.name} (${entry.sizeBytes} B)")
+                    if (!entry.isReadable) sb.append(" — ${entry.reason}")
+                    sb.append('\n')
+                }
+                parts.add(PromptBudget.clampBody(sb.toString(), bodyBudget / 2, "archive listing"))
+                attachment.extractedText?.let {
+                    parts.add(PromptBudget.clampBody(it, bodyBudget, "archive text"))
+                }
+                if (parts.size == 1) parts.add("Summarize the structure of this archive and call out risks.")
+            }
+
+            attachment.isCodeOrText -> {
+                val text = attachment.extractedText.orEmpty()
+                parts.add(
+                    "Attached file `${attachment.name}` (${attachment.formattedSize}):\n```\n" +
+                        PromptBudget.clampBody(text, bodyBudget, "file body") + "\n```"
+                )
+            }
+
+            attachment.isImage -> {
+                val note = "Attached image `${attachment.name}` (${attachment.formattedSize})."
+                val ocr = attachment.extractedText?.takeIf { it.isNotBlank() }
+                parts.add(
+                    if (ocr != null) "$note Extracted text:\n${PromptBudget.clampBody(ocr, bodyBudget, "OCR text")}"
+                    else "$note Describe what is visible."
+                )
+            }
+
+            else -> {
+                parts.add("Attached file `${attachment.name}` (${attachment.formattedSize}).")
+                attachment.extractedText?.let {
+                    parts.add(PromptBudget.clampBody(it, bodyBudget, "file body"))
                 }
             }
-            if (readableFiles.size > 8) {
-                sb.append("- *...and ${readableFiles.size - 8} more source files*\n")
-            }
         }
 
-        if (binaryFiles.isNotEmpty()) {
-            sb.append("\n#### 🔒 Unopened Binary Files:\n")
-            for (b in binaryFiles.take(5)) {
-                sb.append("- `${b.name}`: ${b.reason}\n")
-            }
+        if (userPrompt.isBlank() && parts.size > 1) {
+            parts.add("Please analyze the attachment above.")
         }
+        return parts.joinToString("\n\n").ifBlank { "Hello" }
+    }
 
-        sb.append("\n#### 💡 ${agent.name} Analysis & Summary:\n")
-        if (userPrompt.isNotBlank()) {
-            sb.append("Regarding your query *\"$userPrompt\"*:\n")
+    private fun buildSystemPrompt(agent: Agent, model: HFModelConfig, local: Boolean): String {
+        val sb = StringBuilder(agent.systemPrompt)
+        sb.append("\n\nRuntime notes:")
+        sb.append("\n- You are answering through ${if (local) "an on-device runtime" else "a remote inference endpoint"}.")
+        sb.append("\n- Active weights: ${model.name} (${model.id}).")
+        if (model.supportsVision && !local) {
+            sb.append("\n- The selected repo is multimodal; image bytes are forwarded when the endpoint accepts them.")
         }
-        sb.append("The extracted project structure follows a modular architecture with clean separation between source code, configurations, and assets. All readable source files were parsed successfully into local memory.")
-
+        sb.append("\n- Respect the requested length limit. Prefer Markdown, fenced code blocks and short bullets.")
+        if (agent.bannedPhrases.isNotEmpty()) {
+            sb.append("\n- Never use these phrases: ${agent.bannedPhrases.joinToString(", ")}.")
+        }
         return sb.toString()
     }
 
-    private fun generateImageAnalysis(
-        agent: Agent,
-        model: HFModelConfig,
-        attachment: Attachment,
-        userPrompt: String
-    ): String {
-        val promptFocus = if (userPrompt.isNotBlank()) userPrompt else "General visual summary"
-        return "### 🖼️ Visual Recognition & OCR Analysis\n\n" +
-                "- **File:** `${attachment.name}` (${attachment.formattedSize})\n" +
-                "- **Model:** `${model.name}` (${model.badge ?: "Vision AI"})\n\n" +
-                "**Detected Visual Elements:**\n" +
-                "1. **Layout & Composition:** High-resolution digital visual with structured layout and high contrast.\n" +
-                "2. **Detected Content:** UI components, data cards, telemetry metrics, and dark-mode aesthetic styling.\n" +
-                "3. **Color Palette:** Neon Cyan (`#22D3EE`), Indigo (`#6366F1`), and Slate background accents.\n\n" +
-                "**Analysis for \"$promptFocus\":**\n" +
-                "The image displays a clean user interface designed for real-time model telemetry, local inference monitoring, and interactive execution flow. All visual components are balanced and legible."
-    }
-
-    private fun generateCodeOrTextAnalysis(
-        agent: Agent,
-        model: HFModelConfig,
-        attachment: Attachment,
-        userPrompt: String
-    ): String {
-        val snippet = attachment.extractedText?.take(600) ?: ""
-        return "### 📄 Code & File Inspection: `${attachment.name}`\n\n" +
-                "- **Language / Format:** `${attachment.extension.uppercase()}`\n" +
-                "- **Size:** ${attachment.formattedSize}\n\n" +
-                "```${attachment.extension}\n" +
-                "$snippet\n" +
-                "```\n\n" +
-                "**Summary & Code Review (${agent.name}):**\n" +
-                "- Syntax is valid and follows modern Kotlin/Android conventions.\n" +
-                "- Asynchronous processing is safely dispatched on background coroutines.\n" +
-                "- Memory management is optimized for low-footprint on-device execution."
+    /** Lightweight status blob for the Settings screen. */
+    fun describeEngine(profile: EngineProfile): JSONObject {
+        val engine = engineFor(profile)
+        return JSONObject()
+            .put("id", engine.id)
+            .put("label", engine.label)
+            .put("kind", profile.kind.name)
+            .put("usable", engine.isUsable())
     }
 }
-

@@ -21,5 +21,18 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onStart() {
+        super.onStart()
+        // RAM pressure changes while the app was away; re-measure before the next generation.
+        viewModel.onEnterForeground()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // Drop mapped weights when backgrounded (Settings -> Response Tuning) so a long
+        // download/decode cannot leave the process holding gigabytes it no longer uses.
+        viewModel.onEnterBackground()
+    }
 }
 

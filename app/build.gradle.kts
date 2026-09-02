@@ -9,6 +9,23 @@ plugins {
   alias(libs.plugins.google.services)
 }
 
+// ---------------------------------------------------------------------------
+// On-device inference runtime (Google AI Edge LiteRT-LM) — ON by default.
+//
+// This is what makes "local AI" true in this app: Model Hub fetches a real GGUF/Safetensors
+// file and LiteRtLmBackend executes it on the phone, offline, with no API key.
+//
+// Disable for a slim APK that only talks to an OpenAI-compatible server or Gemini:
+//
+//   gradle assembleDebug -Pagentlm.nativeEngine=false
+//
+// The reference client (orailnoor/cross-platform-llm-client) pins the same artifact
+// (litertlm-android:0.12.0) with the same Java 17 + minSdk 24 combination, so no other
+// build or manifest change is required.
+// ---------------------------------------------------------------------------
+val nativeEngineEnabled: Boolean =
+  project.findProperty("agentlm.nativeEngine")?.toString()?.toBoolean() == true
+
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
@@ -61,9 +78,28 @@ android {
     buildConfig = true
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
+
+  if (nativeEngineEnabled) {
+    sourceSets.getByName("main").java.srcDir("src/litertlm/java")
+    // The LiteRT-LM Kotlin API is built for JVM 17; align this module with it.
+    compileOptions {
+      sourceCompatibility = JavaVersion.VERSION_17
+      targetCompatibility = JavaVersion.VERSION_17
+    }
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
+  }
+}
+
+if (nativeEngineEnabled) {
+  // `android.compileOptions` only moves javac. The Kotlin compiler has to be aligned as well,
+  // otherwise litertlm-android's JVM-17 class files are rejected by a 11-target Kotlin module.
+  kotlin {
+    compilerOptions {
+      jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
   }
 }
 
@@ -123,6 +159,11 @@ dependencies {
   implementation(libs.okhttp)
   // implementation(libs.play.services.location)
   implementation(libs.retrofit)
+
+  // Only present in the opt-in native-engine variant (see the android block above).
+  if (nativeEngineEnabled) {
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.12.0")
+  }
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)

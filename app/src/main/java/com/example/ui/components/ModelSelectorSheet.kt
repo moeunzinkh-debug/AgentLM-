@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -64,6 +65,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -109,7 +111,9 @@ fun ModelSelectorSheet(
     onSelectModel: (HFModelConfig) -> Unit,
     onDownloadModel: (HFModelConfig) -> Unit = {},
     onStartUsingModel: (HFModelConfig) -> Unit = {},
-    onDeleteDownloadedModel: (String) -> Unit = {}
+    onDeleteDownloadedModel: (String) -> Unit = {},
+    onPauseDownload: (String) -> Unit = {},
+    onCancelDownload: (String) -> Unit = {}
 ) {
     if (!isOpen) return
 
@@ -480,6 +484,8 @@ fun ModelSelectorSheet(
                             onDownloadModel = onDownloadModel,
                             onStartUsingModel = onStartUsingModel,
                             onDeleteDownloadedModel = onDeleteDownloadedModel,
+                            onPauseDownload = onPauseDownload,
+                            onCancelDownload = onCancelDownload,
                             onDismiss = onDismiss
                         )
                     }
@@ -539,6 +545,8 @@ fun ModelSelectorSheet(
                             onDownloadModel = onDownloadModel,
                             onStartUsingModel = onStartUsingModel,
                             onDeleteDownloadedModel = onDeleteDownloadedModel,
+                            onPauseDownload = onPauseDownload,
+                            onCancelDownload = onCancelDownload,
                             onDismiss = onDismiss
                         )
                     }
@@ -699,6 +707,8 @@ fun ModelCardItem(
     onDownloadModel: (HFModelConfig) -> Unit,
     onStartUsingModel: (HFModelConfig) -> Unit,
     onDeleteDownloadedModel: (String) -> Unit,
+    onPauseDownload: (String) -> Unit = {},
+    onCancelDownload: (String) -> Unit = {},
     onDismiss: () -> Unit
 ) {
     val isSelected = preset.id == currentModel.id
@@ -868,15 +878,79 @@ fun ModelCardItem(
             lineHeight = 16.sp
         )
 
+        // Exact file the downloader will fetch (resolved against the real repo tree), so the
+        // advertised size and the downloaded size can never disagree.
+        if (preset.preferredFile.isNotBlank()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "weights: " + preset.preferredFile + "  •  " + preset.size,
+                fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace,
+                color = if (preset.isQuantRecommended) Emerald400 else Slate400,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Downloading Progress Bar
+        // Real transfer state: bytes, speed, ETA, pause/resume and errors from the downloader
+        val errorText = dlState?.error
+        if (!errorText.isNullOrBlank()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Rose500.copy(alpha = 0.09f))
+                    .border(1.dp, Rose500.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                    .padding(9.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Warning,
+                        contentDescription = null,
+                        tint = Rose500,
+                        modifier = Modifier.size(13.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Download problem", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Rose500)
+                }
+                Spacer(modifier = Modifier.height(3.dp))
+                Text(text = errorText, fontSize = 10.sp, color = Slate300, lineHeight = 14.sp)
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Slate800)
+                            .clickable { onDownloadModel(preset) }
+                            .padding(horizontal = 9.dp, vertical = 5.dp)
+                    ) {
+                        Text("Retry", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Cyan300)
+                    }
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Slate800)
+                            .clickable { onCancelDownload(preset.id) }
+                            .padding(horizontal = 9.dp, vertical = 5.dp)
+                    ) {
+                        Text("Dismiss", fontSize = 10.sp, color = Slate300)
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
         if (isDownloading) {
+            val paused = dlState?.isPaused == true
             val progressAnim by animateFloatAsState(
                 targetValue = dlState?.progress ?: 0f,
                 animationSpec = tween(durationMillis = 100, easing = FastOutSlowInEasing),
                 label = "dlProgress"
             )
+            val doneMb = (dlState?.downloadedBytes ?: 0L) / 1_048_576.0
+            val totalMb = (dlState?.totalBytes ?: 0L) / 1_048_576.0
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -890,18 +964,32 @@ fun ModelCardItem(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "Downloading ONNX weights...",
+                        text = if (paused) "Paused — partial file kept for resume"
+                        else "Streaming weights from Hugging Face…",
                         fontSize = 11.sp,
-                        color = Cyan300,
+                        color = if (paused) Amber400 else Cyan300,
                         fontWeight = FontWeight.Medium
                     )
                     Text(
-                        text = "${(progressAnim * 100).toInt()}% • ${(dlState?.speedMbps ?: 30.0).toInt()} MB/s",
-                        fontSize = 11.sp,
+                        text = if (paused) "${(progressAnim * 100).toInt()}%"
+                        else "${(progressAnim * 100).toInt()}% • %.1f MB/s • ETA %s".format(
+                            dlState?.speedMbps ?: 0.0,
+                            dlState?.etaLabel() ?: "--:--"
+                        ),
+                        fontSize = 10.sp,
                         fontFamily = FontFamily.Monospace,
                         color = Slate300
                     )
                 }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = dlState?.fileName?.takeIf { it.isNotBlank() }?.let { "File: $it  •  " }.orEmpty() +
+                        "%.0f / %.0f MB".format(doneMb, if (totalMb > 0) totalMb else 0.0),
+                    fontSize = 9.sp,
+                    color = Slate400,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
                 Spacer(modifier = Modifier.height(6.dp))
                 LinearProgressIndicator(
                     progress = { progressAnim },
@@ -909,9 +997,35 @@ fun ModelCardItem(
                         .fillMaxWidth()
                         .height(6.dp)
                         .clip(RoundedCornerShape(3.dp)),
-                    color = Cyan400,
+                    color = if (paused) Amber400 else Cyan400,
                     trackColor = Slate800,
                 )
+                Spacer(modifier = Modifier.height(7.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Slate800)
+                            .clickable { if (paused) onDownloadModel(preset) else onPauseDownload(preset.id) }
+                            .padding(horizontal = 9.dp, vertical = 5.dp)
+                    ) {
+                        Text(
+                            text = if (paused) "Resume" else "Pause",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (paused) Emerald400 else Slate300
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Slate800)
+                            .clickable { onCancelDownload(preset.id) }
+                            .padding(horizontal = 9.dp, vertical = 5.dp)
+                    ) {
+                        Text("Cancel", fontSize = 10.sp, color = Rose500)
+                    }
+                }
             }
             Spacer(modifier = Modifier.height(8.dp))
         }

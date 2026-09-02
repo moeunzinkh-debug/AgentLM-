@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds may reach an inference server on the LAN over plain HTTP. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" trust-user-certificates="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

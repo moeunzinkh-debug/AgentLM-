@@ -9,14 +9,24 @@ import okhttp3.Request
 import org.json.JSONArray
 import java.util.concurrent.TimeUnit
 
-class HfModelSearchService {
+class HfModelSearchService(
+    private val api: HfRepositoryClient = HfRepositoryClient()
+) {
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    suspend fun searchModels(query: String): List<HFModelConfig> = withContext(Dispatchers.IO) {
+    /**
+     * @param enrichFiles when true, every hit is resolved against the real repo tree so the size
+     *   shown in the hub is the actual weight file size instead of a parameter-count guess.
+     */
+    suspend fun searchModels(
+        query: String,
+        token: String? = null,
+        enrichFiles: Boolean = false
+    ): List<HFModelConfig> = withContext(Dispatchers.IO) {
         val cleanQuery = query.trim()
         if (cleanQuery.isBlank()) return@withContext emptyList()
 
@@ -25,14 +35,16 @@ class HfModelSearchService {
         val apiQuery = cleanQuery.replace(Regex("[\\-_]"), " ").replace(Regex("\\s+"), " ").trim()
         val encodedQuery = java.net.URLEncoder.encode(apiQuery, "UTF-8")
 
-        val url = "https://huggingface.co/api/models?search=$encodedQuery&limit=30"
+        val url = "https://huggingface.co/api/models?search=$encodedQuery&limit=30&config=true"
 
         try {
-            val request = Request.Builder()
+            val builder = Request.Builder()
                 .url(url)
-                .header("User-Agent", "AIStudio-QwenAgent/1.0")
+                .header("User-Agent", "AgentLM/2.0")
                 .get()
-                .build()
+            // A token also unlocks *gated* repos (Llama, Gemma, DeepSeek) in search results.
+            if (!token.isNullOrBlank()) builder.header("Authorization", "Bearer $token")
+            val request = builder.build()
 
             val response = httpClient.newCall(request).execute()
             val responseBody = response.body?.string() ?: return@withContext emptyList()
@@ -134,9 +146,47 @@ class HfModelSearchService {
                     )
                 )
             }
-            results
+
+            val enriched = if (enrichFiles) resolveRealFiles(results, token) else results
+            enriched
         } catch (e: Exception) {
             emptyList()
+        }
+    }
+
+    /**
+     * Replaces the parameter-count size guess with the *real* weight file the device would
+     * download — the same file ModelDownloadManager will fetch, so the hub never promises a
+     * size the downloader then contradicts.
+     */
+    private suspend fun resolveRealFiles(
+        models: List<HFModelConfig>,
+        token: String?
+    ): List<HFModelConfig> {
+        if (models.isEmpty()) return models
+        return models.map { model ->
+            val files = api.listFiles(model.id, token).filter { HfRepositoryClient.isWeightFile(it.path) }
+            if (files.isEmpty()) {
+                model.copy(description = model.description + " • no on-device weights found")
+            } else {
+                val pick = HfRepositoryClient.pickFor(files, "Q4_K_M", Long.MAX_VALUE)!!
+                val usableKinds = files.map { it.kind }.distinct()
+                model.copy(
+                    size = pick.readableSize + " (" + pick.quant + ")",
+                    sizeBytes = pick.sizeBytes,
+                    kind = pick.kind,
+                    preferredFile = pick.fileName,
+                    isQuantRecommended = true,
+                    minTier = when {
+                        pick.sizeBytes > 1_600_000_000L -> "high"
+                        pick.sizeBytes > 550_000_000L -> "medium"
+                        else -> "low"
+                    },
+                    tags = model.tags + usableKinds + listOf("files:" + files.size),
+                    description = model.description + " • " + files.size + " weight file(s), " +
+                        usableKinds.joinToString("/")
+                )
+            }
         }
     }
 

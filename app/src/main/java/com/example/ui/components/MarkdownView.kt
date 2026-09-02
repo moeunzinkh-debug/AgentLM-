@@ -60,6 +60,23 @@ import com.example.ui.theme.Slate950
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+/** Small LRU memo for Markdown parses (see the note in [MarkdownView]). */
+private object MarkdownParseCache {
+    private const val MAX_ENTRIES = 24
+    private val entries = object : LinkedHashMap<String, List<MarkdownBlock>>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: Map.Entry<String, List<MarkdownBlock>>?): Boolean =
+            size > MAX_ENTRIES
+    }
+
+    fun blocksFor(text: String): List<MarkdownBlock> {
+        val key = text.length.toString() + ":" + text.hashCode().toString()
+        synchronized(entries) { entries[key]?.let { return it } }
+        val parsed = parseMarkdownBlocks(text)
+        synchronized(entries) { entries[key] = parsed }
+        return parsed
+    }
+}
+
 @Composable
 fun MarkdownView(
     text: String,
@@ -69,7 +86,10 @@ fun MarkdownView(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    val blocks = remember(text) { parseMarkdownBlocks(text) }
+    // Parsed blocks are memoised per (text identity, hash): a finished bubble never re-parses
+    // when an unrelated recomposition happens (e.g. another token arriving in the list), which
+    // is what keeps a long Markdown answer from stalling the frame while a new one streams.
+    val blocks = remember(text) { MarkdownParseCache.blocksFor(text) }
 
     Column(
         modifier = modifier.fillMaxWidth(),
