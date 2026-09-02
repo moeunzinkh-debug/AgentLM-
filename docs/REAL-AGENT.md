@@ -102,3 +102,11 @@ app/src/litertlm/…             opt-in LiteRT-LM backend
 
 CI runs `assembleDebug` (`.github/workflows/build.yml`). Locally: `gradle :app:compileDebugKotlin
 :app:compileDebugAndroidTestKotlin :app:testDebugUnitTest` — all green on this branch.
+
+## 5. Sampling ownership
+
+`ResponsePolicy.temperature/topP/topK` use a negative value to mean "follow the persona", so
+`Personas` stays authoritative until the user deliberately overrides a slider in
+`Settings → Response Tuning`. The resolved numbers are attached to every `EngineRequest` and
+forwarded per request — Gemini `generationConfig.topK`, OpenAI-compatible `top_k` (only when it
+differs from 40, to stay compatible with strict endpoints) and LiteRT-LM `SamplerConfig`.
