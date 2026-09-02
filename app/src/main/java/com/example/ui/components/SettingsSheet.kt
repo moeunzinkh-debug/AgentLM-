@@ -1163,7 +1163,10 @@ private fun AboutTab(
 
             InfoLine(label = "Active engine", value = activeEngine.label)
             InfoLine(label = "Native runtime", value = viewModel.nativeEngineSummary)
-            InfoLine(label = "This device", value = "${"$"}{hardware.chipset} • ${"$"}{hardware.totalRamGb} GB RAM")
+            InfoLine(
+                label = "This device",
+                value = hardware.chipset + " • " + hardware.totalRamGb.toString() + " GB RAM"
+            )
 
             Spacer(modifier = Modifier.height(12.dp))
 
@@ -1408,6 +1411,51 @@ private fun ResponseTuningTab(
         }
 
         // ---- streaming cadence ----
+        TuningCard(
+            title = "Sampling (how the answer is chosen)",
+            subtitle = "Sent with every request, so no weights reload is needed. Negative = follow the persona."
+        ) {
+            SliderRow(
+                label = "Temperature",
+                valueText = if (policy.temperature < 0) "auto (persona)"
+                else "%.2f".format(policy.temperature),
+                value = (if (policy.temperature < 0) 0.7 else policy.temperature).toFloat(),
+                range = 0.0f..1.5f,
+                onValue = { viewModel.setTemperature(it.toDouble()) }
+            )
+            SliderRow(
+                label = "Top-p (nucleus)",
+                valueText = if (policy.topP < 0) "auto (persona)" else "%.2f".format(policy.topP),
+                value = (if (policy.topP < 0) 0.9 else policy.topP).toFloat(),
+                range = 0.1f..1.0f,
+                onValue = { viewModel.setTopP(it.toDouble()) }
+            )
+            SliderRow(
+                label = "Top-k candidates",
+                valueText = if (policy.topK <= 0) "auto (40)" else "${policy.topK}",
+                value = (if (policy.topK <= 0) 40 else policy.topK).toFloat(),
+                range = 1f..100f,
+                onValue = { viewModel.setTopK(it.toInt()) }
+            )
+            Text(
+                text = "On a phone, a small candidate pool matters as much as the token cap: lower " +
+                    "temperature and top-k keep a 0.5B–2B model from rambling past its limit and " +
+                    "producing the repeated loops that look like a freeze. Raise them for creative " +
+                    "writing, lower them for code or facts.",
+                fontSize = 10.sp,
+                color = Slate400,
+                lineHeight = 14.sp
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                MiniButton(
+                    label = "Follow persona again",
+                    accent = false,
+                    onClick = { viewModel.resetSamplingToPersona() }
+                )
+            }
+        }
+
         TuningCard(
             title = "Streaming smoothness",
             subtitle = "Tokens are coalesced before they reach Compose: fewer, bigger repaints instead of one per token."

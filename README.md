@@ -68,6 +68,9 @@ The place that "defines the response": persona/system prompt per agent (`Persona
 * **Max response tokens / lines / context turns / KV budget** — sliders, each labelled with the
   device-derived ceiling and why it exists;
 * **UI smoothness** — coalescing interval & min flush chars, live Markdown, auto-follow;
+* **Sampling** — temperature / top-p / top-k overrides (negative = follow the persona), sent per
+  request so no weights reload is needed; on a phone a small candidate pool is what stops a 0.5B
+  model from rambling past its cap into the repetition loops that look like a freeze;
 * **Anti-hang limits** — prefill, inter-token idle, hard turn cap, background release & keep-alive;
 * **Safety mode** — `Safe` (3–4 GB devices), `Balanced`, `Turbo` (flagships); each mode re-clamps tokens, cadence and Markdown policy.
 

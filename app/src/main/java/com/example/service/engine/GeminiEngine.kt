@@ -226,6 +226,7 @@ class GeminiEngine(
         val generationConfig = JSONObject()
             .put("temperature", request.temperature)
             .put("topP", request.topP)
+            .put("topK", request.topK)
             .put("maxOutputTokens", request.maxOutputTokens.coerceAtLeast(64))
             .put("candidateCount", 1)
 

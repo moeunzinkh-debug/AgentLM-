@@ -30,6 +30,8 @@ data class EngineRequest(
     val imageMime: String = "image/jpeg",
     val temperature: Double = 0.7,
     val topP: Double = 0.9,
+    /** Candidate pool for the sampler; on-device engines honour it directly. */
+    val topK: Int = 40,
     val stopSequences: List<String> = emptyList()
 )
 

@@ -271,6 +271,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setMinFlushChars(chars: Int) = updatePolicy { it.copy(minFlushChars = chars.coerceIn(1, 120)) }
 
+    /** Negative means "follow the persona", so it must survive the clamp. */
+    fun setTemperature(value: Double) =
+        updatePolicy { it.copy(temperature = if (value < 0) -1.0 else value.coerceIn(0.0, 2.0)) }
+
+    fun setTopP(value: Double) =
+        updatePolicy { it.copy(topP = if (value < 0) -1.0 else value.coerceIn(0.05, 1.0)) }
+
+    fun setTopK(value: Int) =
+        updatePolicy { it.copy(topK = if (value <= 0) -1 else value.coerceIn(1, 200)) }
+
+    /** Give the persona its own sampling back. */
+    fun resetSamplingToPersona() =
+        updatePolicy { it.copy(temperature = -1.0, topP = -1.0, topK = -1) }
+
     fun setMarkdownWhileStreaming(enabled: Boolean) =
         updatePolicy { it.copy(renderMarkdownWhileStreaming = enabled) }
 

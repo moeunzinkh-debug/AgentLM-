@@ -254,6 +254,11 @@ class OpenAiCompatEngine(
             .put("temperature", request.temperature)
             .put("top_p", request.topP)
             .put("max_tokens", request.maxOutputTokens.coerceAtLeast(32))
+        // Ollama / llama.cpp / vLLM accept top_k; the strict OpenAI endpoint does not need it,
+        // so it is only sent when the user actually moved away from the default.
+        if (request.topK > 0 && request.topK != 40) {
+            body.put("top_k", request.topK)
+        }
         if (request.stopSequences.isNotEmpty()) {
             body.put("stop", JSONArray(request.stopSequences))
         }

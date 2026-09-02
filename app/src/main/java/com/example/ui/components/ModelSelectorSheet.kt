@@ -883,7 +883,7 @@ fun ModelCardItem(
         if (preset.preferredFile.isNotBlank()) {
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "weights: ${'$'}{preset.preferredFile}  •  ${'$'}{preset.size}",
+                text = "weights: " + preset.preferredFile + "  •  " + preset.size,
                 fontSize = 10.sp,
                 fontFamily = FontFamily.Monospace,
                 color = if (preset.isQuantRecommended) Emerald400 else Slate400,

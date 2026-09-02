@@ -237,7 +237,7 @@ class NativeLlmEngine(
             systemPrompt = request.systemPrompt,
             temperature = request.temperature,
             topP = request.topP,
-            topK = 40,
+            topK = request.topK,
             cpuThreads = threads
         )
 

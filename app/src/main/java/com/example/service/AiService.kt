@@ -218,8 +218,10 @@ class AiService(
             contextNote = null,
             imageBase64 = imageData,
             imageMime = attachment?.mimeType?.takeIf { it.isNotBlank() } ?: "image/jpeg",
-            temperature = agent.temperature.toDouble(),
-            topP = agent.topP.toDouble(),
+            temperature = if (policy.temperature >= 0) policy.temperature
+            else agent.temperature.toDouble(),
+            topP = if (policy.topP >= 0) policy.topP else agent.topP.toDouble(),
+            topK = if (policy.topK > 0) policy.topK else 40,
             maxOutputTokens = personaCap.coerceAtLeast(96),
             contextTokenBudget = contextBudget,
             stopSequences = agent.stopSequences

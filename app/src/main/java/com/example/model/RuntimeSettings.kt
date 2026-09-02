@@ -120,6 +120,13 @@ data class ResponsePolicy(
     /** Retry on CPU when GPU delegate initialization fails (LiteRT-LM bug class). */
     val fallbackGpuToCpu: Boolean = true,
     val quantization: String = "Q4_K_M",
+    /**
+     * Sampling overrides, sent per request (no model reload). Negative = follow the active
+     * persona, which is what makes Personas and this tab complementary instead of conflicting.
+     */
+    val temperature: Double = -1.0,
+    val topP: Double = -1.0,
+    val topK: Int = -1,
     /** UI coalescing: at most one recomposition per interval. */
     val flushIntervalMs: Long = 90L,
     /** Also flush early once this many new chars accumulated. */
@@ -245,6 +252,9 @@ class RuntimeSettingsRepository private constructor(
             .put("gpuEnabled", p.gpuEnabled)
             .put("fallbackGpuToCpu", p.fallbackGpuToCpu)
             .put("quantization", p.quantization)
+            .put("temperature", p.temperature)
+            .put("topP", p.topP)
+            .put("topK", p.topK)
             .put("flushIntervalMs", p.flushIntervalMs)
             .put("minFlushChars", p.minFlushChars)
             .put("renderMarkdownWhileStreaming", p.renderMarkdownWhileStreaming)
@@ -291,6 +301,9 @@ class RuntimeSettingsRepository private constructor(
                 gpuEnabled = obj.optBoolean("gpuEnabled", true),
                 fallbackGpuToCpu = obj.optBoolean("fallbackGpuToCpu", true),
                 quantization = obj.optString("quantization", "Q4_K_M"),
+                temperature = obj.optDouble("temperature", -1.0),
+                topP = obj.optDouble("topP", -1.0),
+                topK = obj.optInt("topK", -1),
                 flushIntervalMs = obj.optLong("flushIntervalMs", 90L),
                 minFlushChars = obj.optInt("minFlushChars", 14),
                 renderMarkdownWhileStreaming = obj.optBoolean("renderMarkdownWhileStreaming", false),
