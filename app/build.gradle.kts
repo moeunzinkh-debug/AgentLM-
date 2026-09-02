@@ -9,6 +9,19 @@ plugins {
   alias(libs.plugins.google.services)
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in on-device inference runtime (Google AI Edge LiteRT-LM).
+//
+//   gradle assembleDebug -Pagentlm.nativeEngine=true
+//
+// Off by default so the standard APK stays slim and never depends on a native artifact
+// it does not use. When enabled, LiteRtLmBackend is compiled in from src/litertlm/java
+// and discovered reflectively at runtime, so Model Hub downloads can actually execute
+// on the phone (offline) instead of needing a server.
+// ---------------------------------------------------------------------------
+val nativeEngineEnabled: Boolean =
+  project.findProperty("agentlm.nativeEngine")?.toString()?.toBoolean() == true
+
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
@@ -61,6 +74,15 @@ android {
     buildConfig = true
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
+
+  if (nativeEngineEnabled) {
+    sourceSets.getByName("main").java.srcDir("src/litertlm/java")
+    // The LiteRT-LM Kotlin API is built for JVM 17; align this module with it.
+    compileOptions {
+      sourceCompatibility = JavaVersion.VERSION_17
+      targetCompatibility = JavaVersion.VERSION_17
+    }
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
@@ -123,6 +145,11 @@ dependencies {
   implementation(libs.okhttp)
   // implementation(libs.play.services.location)
   implementation(libs.retrofit)
+
+  // Only present in the opt-in native-engine variant (see the android block above).
+  if (nativeEngineEnabled) {
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.12.0")
+  }
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)

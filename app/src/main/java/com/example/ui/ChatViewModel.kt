@@ -1,46 +1,96 @@
 package com.example.ui
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.model.Agent
 import com.example.model.AgentCatalog
 import com.example.model.Attachment
+import com.example.model.BudgetAdvice
 import com.example.model.ChatMessage
 import com.example.model.ChatSession
 import com.example.model.DeviceSpecs
 import com.example.model.DownloadStatus
+import com.example.model.EngineProfile
 import com.example.model.HFModelConfig
+import com.example.model.HardwareInfo
+import com.example.model.HardwareProbe
 import com.example.model.MessageRole
 import com.example.model.MessageStatus
 import com.example.model.ModelCatalog
 import com.example.model.ModelDownloadProgress
+import com.example.model.ResponseBudgetAdvisor
+import com.example.model.ResponsePolicy
+import com.example.model.RuntimeSettings
+import com.example.model.RuntimeSettingsRepository
+import com.example.model.SafetyMode
 import com.example.service.AiService
+import com.example.service.ChatHistoryStore
 import com.example.service.HfModelSearchService
+import com.example.service.HfRemoteFile
+import com.example.service.ModelDownloadManager
+import com.example.service.ResponseStreamer
+import com.example.service.engine.NativeBackends
 import com.example.util.FileAttachmentHelper
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 
-class ChatViewModel(
-    private val aiService: AiService = AiService(),
-    private val hfSearchService: HfModelSearchService = HfModelSearchService()
-) : ViewModel() {
+/**
+ * Owns the chat, the real downloads and — most importantly — the *freeze-proof* streaming path.
+ *
+ * While a reply is being generated, only [streamingText] / [streamStats] change. The message list
+ * is written exactly twice per turn (start + commit), so the LazyColumn never rebuilds on every
+ * token. See [ResponseStreamer] for the coalescing and timeout rules.
+ */
+class ChatViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val app: Application = application
+
+    /** Downloads must survive the ViewModel/UI, so they run in their own supervisor scope. */
+    private val downloadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val settingsRepository = RuntimeSettingsRepository.get(app, viewModelScope)
+    private val downloads = ModelDownloadManager(app, downloadScope)
+    private val history = ChatHistoryStore(app)
+    private val hfSearchService = HfModelSearchService()
+    private val aiService = AiService(downloads, File(app.cacheDir, "agentlm_tmp"))
+    private val streamer = ResponseStreamer()
 
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+
+    /** The live bubble text. Updated on a time budget — never per token. */
+    private val _streamingText = MutableStateFlow("")
+    val streamingText: StateFlow<String> = _streamingText.asStateFlow()
+
+    private val _streamStats = MutableStateFlow<ResponseStreamer.Stats?>(null)
+    val streamStats: StateFlow<ResponseStreamer.Stats?> = _streamStats.asStateFlow()
+
+    private val _hardware = MutableStateFlow(HardwareProbe.probe(app))
+    val hardware: StateFlow<HardwareInfo> = _hardware.asStateFlow()
+
+    private val _deviceSpecs = MutableStateFlow(ModelCatalog.deviceSpecsFrom(_hardware.value))
+    val deviceSpecs: StateFlow<DeviceSpecs> = _deviceSpecs.asStateFlow()
+
+    private val _budgetAdvice = MutableStateFlow(
+        ResponseBudgetAdvisor.advise(_hardware.value, ModelCatalog.DEFAULT_MODEL)
+    )
+    val budgetAdvice: StateFlow<BudgetAdvice> = _budgetAdvice.asStateFlow()
 
     private val _currentAgent = MutableStateFlow<Agent>(AgentCatalog.AGENTS.first())
     val currentAgent: StateFlow<Agent> = _currentAgent.asStateFlow()
 
     private val _currentModel = MutableStateFlow<HFModelConfig>(ModelCatalog.DEFAULT_MODEL)
     val currentModel: StateFlow<HFModelConfig> = _currentModel.asStateFlow()
-
-    private val _deviceSpecs = MutableStateFlow<DeviceSpecs>(ModelCatalog.detectDevice())
-    val deviceSpecs: StateFlow<DeviceSpecs> = _deviceSpecs.asStateFlow()
 
     private val _isStreaming = MutableStateFlow(false)
     val isStreaming: StateFlow<Boolean> = _isStreaming.asStateFlow()
@@ -51,86 +101,230 @@ class ChatViewModel(
     private val _selectedAttachment = MutableStateFlow<Attachment?>(null)
     val selectedAttachment: StateFlow<Attachment?> = _selectedAttachment.asStateFlow()
 
-    // Settings & Hardware Accelerators
+    private val _runtimeSettings = settingsRepository.settings
+    val runtimeSettings: StateFlow<RuntimeSettings> = _runtimeSettings
+
+    /** Derived from the policy so the existing GPU/CPU settings UI keeps working. */
     private val _isGpuEnabled = MutableStateFlow(true)
     val isGpuEnabled: StateFlow<Boolean> = _isGpuEnabled.asStateFlow()
 
     private val _cpuThreads = MutableStateFlow(4)
     val cpuThreads: StateFlow<Int> = _cpuThreads.asStateFlow()
 
-    private val _cacheSizeBytes = MutableStateFlow(148_600_000L) // ~148.6 MB
+    private val _lastFinishReason = MutableStateFlow<String?>(null)
+    val lastFinishReason: StateFlow<String?> = _lastFinishReason.asStateFlow()
+
+    private val _cacheSizeBytes = MutableStateFlow(0L)
     val cacheSizeBytes: StateFlow<Long> = _cacheSizeBytes.asStateFlow()
 
-    // Chat History Management
-    private val _chatSessions = MutableStateFlow<List<ChatSession>>(
-        listOf(
-            ChatSession(
-                title = "Kotlin Coroutines & Flow Optimization",
-                timestamp = System.currentTimeMillis() - 3600_000L * 2,
-                messageCount = 4,
-                previewText = "How to implement efficient channel buffers with backpressure in Jetpack Compose...",
-                messages = listOf(
-                    ChatMessage(
-                        role = MessageRole.USER,
-                        content = "How to implement efficient channel buffers with backpressure in Jetpack Compose?"
-                    ),
-                    ChatMessage(
-                        role = MessageRole.ASSISTANT,
-                        content = "To handle backpressure in Kotlin Coroutines with Flow:\n\n```kotlin\nval sharedFlow = MutableSharedFlow<Event>(\n    replay = 0,\n    extraBufferCapacity = 64,\n    onBufferOverflow = BufferOverflow.DROP_OLDEST\n)\n```\nThis prevents UI freezes under rapid event bursts.",
-                        agentEmoji = "⚡"
-                    )
-                ),
-                agentEmoji = "⚡",
-                modelName = "Qwen 2.5 Coder (0.5B)"
-            ),
-            ChatSession(
-                title = "ZIP Project Architecture Analysis",
-                timestamp = System.currentTimeMillis() - 3600_000L * 24,
-                messageCount = 3,
-                previewText = "Extracted 6 source files and verified Android Clean Architecture boundaries...",
-                messages = listOf(
-                    ChatMessage(
-                        role = MessageRole.USER,
-                        content = "Please analyze my uploaded project archive structure."
-                    ),
-                    ChatMessage(
-                        role = MessageRole.ASSISTANT,
-                        content = "### 📦 Architecture Review\n- **UI Layer**: Jetpack Compose M3\n- **Domain**: Repository & UseCases\n- **Status**: Production-ready Clean Architecture.",
-                        agentEmoji = "🤖"
-                    )
-                ),
-                agentEmoji = "🤖",
-                modelName = "Qwen 2.5 (0.5B Instruct)"
-            )
-        )
-    )
+    private val _modelStorageBytes = MutableStateFlow(0L)
+    val modelStorageBytes: StateFlow<Long> = _modelStorageBytes.asStateFlow()
+
+    private val _chatSessions = MutableStateFlow<List<ChatSession>>(emptyList())
     val chatSessions: StateFlow<List<ChatSession>> = _chatSessions.asStateFlow()
 
-    // Model Download Tracking
-    private val _downloadStates = MutableStateFlow<Map<String, ModelDownloadProgress>>(
-        mapOf(
-            ModelCatalog.DEFAULT_MODEL.id to ModelDownloadProgress(
-                modelId = ModelCatalog.DEFAULT_MODEL.id,
-                status = DownloadStatus.DOWNLOADED,
-                progress = 1.0f,
-                downloadedBytes = ModelCatalog.DEFAULT_MODEL.sizeBytes,
-                totalBytes = ModelCatalog.DEFAULT_MODEL.sizeBytes,
-                speedMbps = 45.0
-            )
-        )
-    )
-    val downloadStates: StateFlow<Map<String, ModelDownloadProgress>> = _downloadStates.asStateFlow()
+    val downloadStates: StateFlow<Map<String, ModelDownloadProgress>> = downloads.states
 
-    // Live Hugging Face API Model Search
+    private val _resolvedFiles = MutableStateFlow<Map<String, HfRemoteFile>>(emptyMap())
+    val resolvedFiles: StateFlow<Map<String, HfRemoteFile>> = _resolvedFiles.asStateFlow()
+
     private val _hfSearchResults = MutableStateFlow<List<HFModelConfig>>(emptyList())
     val hfSearchResults: StateFlow<List<HFModelConfig>> = _hfSearchResults.asStateFlow()
 
     private val _isSearchingHf = MutableStateFlow(false)
     val isSearchingHf: StateFlow<Boolean> = _isSearchingHf.asStateFlow()
 
+    private val _enginePing = MutableStateFlow<Map<String, EnginePingResult>>(emptyMap())
+    val enginePing: StateFlow<Map<String, EnginePingResult>> = _enginePing.asStateFlow()
+
+    data class EnginePingResult(
+        val ok: Boolean,
+        val message: String,
+        val detail: String?,
+        val at: Long = System.currentTimeMillis()
+    )
+
+    val nativeEngineSummary: String get() = NativeBackends.describe()
+
     private var searchJob: Job? = null
-    private val downloadJobs = mutableMapOf<String, Job>()
     private var activeJob: Job? = null
+
+    /** Guards against a cancelled/stale generation writing into a *new* chat. */
+    private var generationSerial = 0
+
+    init {
+        downloads.reconcile()
+        viewModelScope.launch {
+            _runtimeSettings.collect { settings ->
+                _isGpuEnabled.value = settings.policy.gpuEnabled
+                _cpuThreads.value = settings.policy.effectiveThreads(_hardware.value.cores)
+            }
+        }
+        viewModelScope.launch {
+            _chatSessions.value = history.loadSessions()
+            val draft = history.loadDraft()
+            if (draft.isNotEmpty() && _messages.value.isEmpty()) _messages.value = draft
+            measureCache()
+            // Re-measure hardware once layout settles: RAM pressure changes through the day.
+            reprobeHardware()
+        }
+        startIdleReleaseWatch()
+    }
+
+    // --------------------------------------------------------- lifecycle helpers ----
+
+    /** Called from MainActivity.onStop(): the UI is gone, so heavy idle state must go too. */
+    fun onEnterBackground() {
+        val policy = _runtimeSettings.value.policy
+        if (policy.releaseModelOnBackground && !_isStreaming.value) {
+            aiService.releaseNativeSession()
+        }
+    }
+
+    fun onEnterForeground() {
+        reprobeHardware()
+    }
+
+    /** Periodic idle-unload check (keep-alive window from Settings → Response Tuning). */
+    private fun startIdleReleaseWatch() {
+        viewModelScope.launch {
+            while (true) {
+                delay(30_000)
+                if (_isStreaming.value) continue
+                val policy = _runtimeSettings.value.policy
+                aiService.maybeReleaseNative(policy.modelKeepAliveSec)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ hardware ----
+
+    fun reprobeHardware() {
+        viewModelScope.launch(Dispatchers.Default) {
+            val fresh = HardwareProbe.probe(app)
+            _hardware.value = fresh
+            _deviceSpecs.value = ModelCatalog.deviceSpecsFrom(fresh)
+            refreshAdvice()
+        }
+    }
+
+    private fun refreshAdvice() {
+        _budgetAdvice.value = ResponseBudgetAdvisor.advise(_hardware.value, _currentModel.value)
+    }
+
+    /** Real numbers: actual cache tree + bytes of downloaded weights. */
+    private fun measureCache() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val cacheBytes = try {
+                app.cacheDir.walkBottomUp().sumOf { if (it.isFile) it.length() else 0L }
+            } catch (e: Exception) {
+                0L
+            }
+            _cacheSizeBytes.value = cacheBytes
+            _modelStorageBytes.value = downloads.totalModelBytesOnDisk()
+        }
+    }
+
+    // -------------------------------------------------------------------- policy ----
+
+    fun updateSettings(transform: (RuntimeSettings) -> RuntimeSettings) {
+        settingsRepository.update(transform)
+    }
+
+    fun updatePolicy(transform: (ResponsePolicy) -> ResponsePolicy) {
+        settingsRepository.update { it.copy(policy = transform(it.policy)) }
+    }
+
+    fun setSafetyMode(mode: SafetyMode) {
+        settingsRepository.update { current ->
+            current.copy(policy = current.policyFor(mode).copy(safetyMode = mode))
+        }
+    }
+
+    /** Applies the measured device recommendation as the active limits. */
+    fun applyDeviceAdvice() {
+        val advice = _budgetAdvice.value
+        updatePolicy {
+            it.copy(
+                maxOutputTokens = advice.maxOutputTokens,
+                contextTokenBudget = advice.contextTokenBudget,
+                historyTurnsOverride = advice.historyTurns,
+                cpuThreads = advice.cpuThreads,
+                gpuEnabled = advice.gpuEnabled,
+                quantization = advice.quantization,
+                flushIntervalMs = ResponseBudgetAdvisor.flushIntervalMs(_hardware.value),
+                minFlushChars = ResponseBudgetAdvisor.minFlushChars(_hardware.value)
+            )
+        }
+    }
+
+    fun toggleGpu(enabled: Boolean) = updatePolicy { it.copy(gpuEnabled = enabled) }
+
+    fun setCpuThreads(threads: Int) = updatePolicy { it.copy(cpuThreads = threads.coerceIn(1, 16)) }
+
+    fun setMaxTokens(tokens: Int) = updatePolicy { it.copy(maxOutputTokens = tokens.coerceIn(0, 4_096)) }
+
+    fun setContextBudget(tokens: Int) = updatePolicy { it.copy(contextTokenBudget = tokens) }
+
+    fun setHistoryTurns(turns: Int) = updatePolicy { it.copy(historyTurnsOverride = turns) }
+
+    fun setFlushInterval(ms: Long) = updatePolicy { it.copy(flushIntervalMs = ms.coerceIn(30L, 500L)) }
+
+    fun setMinFlushChars(chars: Int) = updatePolicy { it.copy(minFlushChars = chars.coerceIn(1, 120)) }
+
+    fun setMarkdownWhileStreaming(enabled: Boolean) =
+        updatePolicy { it.copy(renderMarkdownWhileStreaming = enabled) }
+
+    fun setAutoFollowScroll(enabled: Boolean) = updatePolicy { it.copy(autoFollowScroll = enabled) }
+
+    fun setTimeouts(prefillSec: Int, idleSec: Int, hardSec: Int) = updatePolicy {
+        it.copy(
+            prefillTimeoutSec = prefillSec.coerceIn(10, 600),
+            idleTokenTimeoutSec = idleSec.coerceIn(3, 120),
+            hardTimeoutSec = hardSec.coerceIn(30, 1_800)
+        )
+    }
+
+    fun setReleaseModelOnBackground(enabled: Boolean) =
+        updatePolicy { it.copy(releaseModelOnBackground = enabled) }
+
+    // ------------------------------------------------------------------- engines ----
+
+    fun setActiveEngine(id: String) {
+        settingsRepository.update { it.copy(activeEngineId = id) }
+    }
+
+    fun saveEngineProfile(profile: EngineProfile) {
+        settingsRepository.update { current ->
+            val replaced = current.engines.map { if (it.id == profile.id) profile else it }
+            val list = if (replaced.any { it.id == profile.id }) replaced else replaced + profile
+            current.copy(engines = list)
+        }
+    }
+
+    fun removeEngine(id: String) {
+        settingsRepository.update { current ->
+            val kept = current.engines.filterNot { it.id == id }
+            current.copy(
+                engines = kept.ifEmpty { EngineProfile.DEFAULTS },
+                activeEngineId = if (current.activeEngineId == id) EngineProfile.GEMINI_BUILTIN.id
+                else current.activeEngineId
+            )
+        }
+    }
+
+    fun testEngine(id: String) {
+        viewModelScope.launch {
+            val profile = _runtimeSettings.value.engines.find { it.id == id } ?: return@launch
+            _enginePing.update { it + (id to EnginePingResult(false, "Testing…", null)) }
+            val engine = aiService.engineFor(profile)
+            val ping = runCatching { engine.ping() }
+                .getOrElse { com.example.service.engine.EnginePing(false, "Probe failed: ${it.message}", null) }
+            _enginePing.update { it + (id to EnginePingResult(ping.ok, ping.message, ping.detail)) }
+        }
+    }
+
+    // ------------------------------------------------------------------- models ----
 
     fun searchHfModels(query: String) {
         searchJob?.cancel()
@@ -140,12 +334,19 @@ class ChatViewModel(
             _isSearchingHf.value = false
             return
         }
-
         searchJob = viewModelScope.launch {
             _isSearchingHf.value = true
-            delay(350) // Debounce rapid keystrokes
-            val results = hfSearchService.searchModels(clean)
-            _hfSearchResults.value = results
+            delay(350) // debounce rapid keystrokes
+            val settings = _runtimeSettings.value
+            val token = settings.engines
+                .firstOrNull { it.id == "hf-router" }?.apiKey?.takeIf { it.isNotBlank() }
+            // Live search + real repo-tree enrichment: the hub shows the byte size of the file
+            // the downloader will actually fetch, and marks whether it fits this device.
+            _hfSearchResults.value = hfSearchService.searchModels(
+                query = clean,
+                token = token,
+                enrichFiles = true
+            )
             _isSearchingHf.value = false
         }
     }
@@ -156,88 +357,68 @@ class ChatViewModel(
         _isSearchingHf.value = false
     }
 
+    fun selectModel(model: HFModelConfig) {
+        _currentModel.value = model
+        refreshAdvice()
+    }
+
+    fun isModelDownloaded(modelId: String): Boolean = downloads.isDownloaded(modelId)
+
+    /** Called by the hub UI; returns instantly, progress flows through [downloadStates]. */
+    fun startDownloadModel(model: HFModelConfig) {
+        val settings = _runtimeSettings.value
+        val advice = _budgetAdvice.value
+        downloads.start(
+            model = model,
+            residentBudgetBytes = (advice.modelResidentMb + 300L) * 1_048_576L,
+            preferredQuant = settings.preferredHfQuant.ifBlank { advice.quantization },
+            token = settings.engines.firstOrNull { it.id == "hf-router" }?.apiKey?.ifBlank { null },
+            onResolved = { file ->
+                _resolvedFiles.update { it + (model.id to file) }
+            }
+        )
+    }
+
+    fun pauseDownload(modelId: String) = downloads.pause(modelId)
+
+    fun cancelDownload(modelId: String) {
+        downloads.cancel(modelId)
+        measureCache()
+    }
+
+    fun deleteDownloadedModel(modelId: String) {
+        downloads.deleteDownload(modelId)
+        measureCache()
+    }
+
+    /**
+     * "Use offline" selects the weights, and only switches to the on-device engine when a native
+     * runtime is actually linked into this build — otherwise the downloaded file stays usable as
+     * a source for a LAN llama.cpp/Ollama server instead of dead-ending with an unavailable engine.
+     */
+    fun startUsingDownloadedModel(model: HFModelConfig) {
+        selectModel(model)
+        val downloaded = isModelDownloaded(model.id)
+        if (downloaded && NativeBackends.discover() != null) {
+            setActiveEngine(EngineProfile.LOCAL_ENGINE.id)
+        }
+    }
+
+    fun clearCache() {
+        viewModelScope.launch {
+            downloads.clearCaches()
+            measureCache()
+        }
+    }
+
+    // ------------------------------------------------------------- composer state ----
+
     fun onInputChange(text: String) {
         _input.value = text
     }
 
     fun selectAgent(agent: Agent) {
-        if (_currentAgent.value.id != agent.id) {
-            _currentAgent.value = agent
-        }
-    }
-
-    fun selectModel(model: HFModelConfig) {
-        _currentModel.value = model
-    }
-
-    fun isModelDownloaded(modelId: String): Boolean {
-        return _downloadStates.value[modelId]?.status == DownloadStatus.DOWNLOADED
-    }
-
-    fun startDownloadModel(model: HFModelConfig) {
-        if (downloadJobs[model.id]?.isActive == true) return
-
-        val totalBytes = model.sizeBytes
-        val job = viewModelScope.launch {
-            val totalSteps = 20
-            for (step in 1..totalSteps) {
-                delay(120)
-                val progress = step / totalSteps.toFloat()
-                val downloadedBytes = (totalBytes * progress).toLong()
-                val speed = 25.0 + (step % 5) * 6.2
-
-                val currentMap = _downloadStates.value.toMutableMap()
-                currentMap[model.id] = ModelDownloadProgress(
-                    modelId = model.id,
-                    status = if (step == totalSteps) DownloadStatus.DOWNLOADED else DownloadStatus.DOWNLOADING,
-                    progress = progress,
-                    downloadedBytes = downloadedBytes,
-                    totalBytes = totalBytes,
-                    speedMbps = speed
-                )
-                _downloadStates.value = currentMap
-            }
-            downloadJobs.remove(model.id)
-        }
-        downloadJobs[model.id] = job
-    }
-
-    fun cancelDownload(modelId: String) {
-        downloadJobs[modelId]?.cancel()
-        downloadJobs.remove(modelId)
-        val currentMap = _downloadStates.value.toMutableMap()
-        currentMap.remove(modelId)
-        _downloadStates.value = currentMap
-    }
-
-    fun deleteDownloadedModel(modelId: String) {
-        cancelDownload(modelId)
-        val currentMap = _downloadStates.value.toMutableMap()
-        currentMap[modelId] = ModelDownloadProgress(
-            modelId = modelId,
-            status = DownloadStatus.NOT_DOWNLOADED,
-            progress = 0f,
-            downloadedBytes = 0L,
-            totalBytes = 0L
-        )
-        _downloadStates.value = currentMap
-    }
-
-    fun startUsingDownloadedModel(model: HFModelConfig) {
-        // Ensure marked as downloaded
-        if (!isModelDownloaded(model.id)) {
-            val currentMap = _downloadStates.value.toMutableMap()
-            currentMap[model.id] = ModelDownloadProgress(
-                modelId = model.id,
-                status = DownloadStatus.DOWNLOADED,
-                progress = 1.0f,
-                downloadedBytes = model.sizeBytes,
-                totalBytes = model.sizeBytes,
-                speedMbps = 50.0
-            )
-            _downloadStates.value = currentMap
-        }
-        selectModel(model)
+        if (_currentAgent.value.id != agent.id) _currentAgent.value = agent
     }
 
     fun setAttachment(attachment: Attachment?) {
@@ -260,26 +441,15 @@ class ChatViewModel(
         _selectedAttachment.value = FileAttachmentHelper.createSampleImageAttachment()
     }
 
-    fun toggleGpu(enabled: Boolean) {
-        _isGpuEnabled.value = enabled
-    }
-
-    fun setCpuThreads(threads: Int) {
-        _cpuThreads.value = threads.coerceIn(1, 16)
-    }
-
-    fun clearCache() {
-        // Simulates clearing app tokenizer cache, temp attachment buffers & inference cache
-        _cacheSizeBytes.value = 0L
-    }
+    // -------------------------------------------------------------------- chat ops ----
 
     fun startNewChat() {
         stopGeneration()
         val currentMsgs = _messages.value
         if (currentMsgs.isNotEmpty()) {
             val firstUserPrompt = currentMsgs.firstOrNull { it.role == MessageRole.USER }?.content ?: "Conversation"
-            val title = if (firstUserPrompt.length > 36) firstUserPrompt.take(36) + "..." else firstUserPrompt
-            val newSession = ChatSession(
+            val title = if (firstUserPrompt.length > 36) firstUserPrompt.take(36) + "…" else firstUserPrompt
+            val session = ChatSession(
                 title = title,
                 timestamp = System.currentTimeMillis(),
                 messageCount = currentMsgs.size,
@@ -288,12 +458,12 @@ class ChatViewModel(
                 agentEmoji = _currentAgent.value.emoji,
                 modelName = _currentModel.value.name
             )
-            val updated = listOf(newSession) + _chatSessions.value
-            _chatSessions.value = updated
+            viewModelScope.launch { _chatSessions.value = history.appendSession(session) }
         }
         _messages.value = emptyList()
         _selectedAttachment.value = null
         _input.value = ""
+        viewModelScope.launch { history.clearDraft() }
     }
 
     fun loadChatSession(session: ChatSession) {
@@ -304,115 +474,207 @@ class ChatViewModel(
     }
 
     fun deleteChatSession(sessionId: String) {
-        val updated = _chatSessions.value.filterNot { it.id == sessionId }
-        _chatSessions.value = updated
+        viewModelScope.launch {
+            _chatSessions.value = history.deleteSession(sessionId)
+        }
     }
 
     fun deleteAllChatHistory() {
-        _chatSessions.value = emptyList()
+        viewModelScope.launch {
+            history.clearSessions()
+            _chatSessions.value = emptyList()
+        }
     }
 
     fun clearAllChattingAndHistory() {
         stopGeneration()
         _messages.value = emptyList()
-        _chatSessions.value = emptyList()
         _selectedAttachment.value = null
         _input.value = ""
+        viewModelScope.launch {
+            history.clearSessions()
+            history.clearDraft()
+            _chatSessions.value = emptyList()
+        }
     }
 
     fun clearChat() {
         stopGeneration()
         _messages.value = emptyList()
+        viewModelScope.launch { history.clearDraft() }
     }
 
+    /**
+     * Cancels the generation job (which cancels the HTTP call / native decode) and commits
+     * whatever text already arrived. No coroutine hop, so the bubble never flickers empty.
+     */
     fun stopGeneration() {
-        activeJob?.cancel()
+        val job = activeJob
         activeJob = null
+        generationSerial++
         _isStreaming.value = false
-        val currentList = _messages.value
-        if (currentList.isNotEmpty() && currentList.last().status == MessageStatus.STREAMING) {
-            val updated = currentList.toMutableList()
-            val last = updated.removeAt(updated.size - 1)
-            updated.add(last.copy(status = MessageStatus.SUCCESS))
+        job?.cancel()
+
+        val partial = _streamingText.value
+        val list = _messages.value
+        if (list.isNotEmpty() && list.last().status == MessageStatus.STREAMING) {
+            val last = list.last()
+            val content = partial.ifBlank { last.content }
+                .ifBlank { "— stopped before any token arrived —" }
+            val updated = list.dropLast(1) + last.copy(content = content, status = MessageStatus.SUCCESS)
             _messages.value = updated
+            viewModelScope.launch { history.saveDraft(updated) }
         }
+        _streamingText.value = ""
+        _streamStats.value = null
+        _lastFinishReason.value = "stopped"
     }
 
     fun sendMessage(promptText: String? = null) {
         val text = (promptText ?: _input.value).trim()
         val attachment = _selectedAttachment.value
-
         if ((text.isEmpty() && attachment == null) || _isStreaming.value) return
 
-        val messageContent = if (text.isNotEmpty()) text else if (attachment != null) "Please inspect and summarize ${attachment.name}" else ""
+        val settings = _runtimeSettings.value
+        val policy = settings.policy
+        val advice = _budgetAdvice.value
+        val maxTokens = policy.effectiveMaxTokens(advice.maxOutputTokens)
+        val contextBudget = policy.effectiveContextBudget(advice.contextTokenBudget)
+
+        val messageContent = if (text.isNotEmpty()) text
+        else if (attachment != null) "Please inspect and summarize ${attachment.name}"
+        else return
 
         _input.value = ""
         _selectedAttachment.value = null
 
-        val isLocal = isModelDownloaded(_currentModel.value.id)
-
+        val localWeights = isModelDownloaded(_currentModel.value.id)
         val userMsg = ChatMessage(
             role = MessageRole.USER,
             content = messageContent,
             status = MessageStatus.SUCCESS,
             attachment = attachment,
-            isLocalExecution = isLocal
+            isLocalExecution = localWeights && settings.activeEngine().kind == com.example.model.EngineKind.LOCAL_NATIVE
         )
-
-        val assistantMsg = ChatMessage(
+        val placeholder = ChatMessage(
             role = MessageRole.ASSISTANT,
             content = "",
             status = MessageStatus.STREAMING,
             agentEmoji = _currentAgent.value.emoji,
-            isLocalExecution = isLocal
+            isLocalExecution = userMsg.isLocalExecution
         )
 
-        val updatedList = _messages.value + userMsg + assistantMsg
-        _messages.value = updatedList
+        // Two list writes per turn: one to open the bubble, one to commit it. Nothing in between.
+        _messages.update { it + userMsg + placeholder }
+        _streamingText.value = ""
+        _streamStats.value = null
         _isStreaming.value = true
+        val serial = ++generationSerial
+        viewModelScope.launch { history.saveDraft(_messages.value) }
 
         activeJob = viewModelScope.launch {
-            val history = _messages.value.dropLast(2)
-            val currentAgentVal = _currentAgent.value
-            val currentModelVal = _currentModel.value
+            val historySnapshot = _messages.value.dropLast(2)
+            val agentVal = _currentAgent.value
+            val modelVal = _currentModel.value
 
-            aiService.streamReply(
-                agent = currentAgentVal,
-                model = currentModelVal,
-                history = history,
+            val flow = aiService.streamWithFallback(
+                agent = agentVal,
+                model = modelVal,
+                history = historySnapshot,
                 userPrompt = messageContent,
-                attachment = attachment
-            ).catch { err ->
+                attachment = attachment,
+                settings = settings,
+                maxTokens = maxTokens,
+                contextBudget = contextBudget
+            )
+
+            val outcome = try {
+                streamer.run(
+                    scope = this,
+                    events = flow,
+                    policy = policy,
+                    onText = { snapshot -> _streamingText.value = snapshot },
+                    onStats = { stats -> _streamStats.value = stats }
+                )
+            } catch (ce: java.util.concurrent.CancellationException) {
+                commitStreaming(serial, _streamingText.value, MessageStatus.SUCCESS, "stopped")
                 _isStreaming.value = false
-                val list = _messages.value.toMutableList()
-                if (list.isNotEmpty()) {
-                    val last = list.removeAt(list.size - 1)
-                    list.add(
-                        last.copy(
-                            content = "⚠️ Error: ${err.localizedMessage ?: "Failed to generate response."}",
-                            status = MessageStatus.ERROR
-                        )
-                    )
-                    _messages.value = list
-                }
-            }.collect { accumulatedChunk ->
-                val list = _messages.value.toMutableList()
-                if (list.isNotEmpty()) {
-                    val last = list.removeAt(list.size - 1)
-                    list.add(last.copy(content = accumulatedChunk))
-                    _messages.value = list
-                }
+                throw ce
             }
 
-            // Finish streaming
-            val list = _messages.value.toMutableList()
-            if (list.isNotEmpty()) {
-                val last = list.removeAt(list.size - 1)
-                list.add(last.copy(status = MessageStatus.SUCCESS))
-                _messages.value = list
+            when (outcome) {
+                is ResponseStreamer.Outcome.Completed -> {
+                    commitStreaming(serial, outcome.text, MessageStatus.SUCCESS, outcome.stats.finishReason)
+                    _streamStats.value = outcome.stats
+                }
+
+                is ResponseStreamer.Outcome.Failed -> {
+                    val message = buildString {
+                        append("⚠️ ").append(outcome.message)
+                        if (!outcome.hint.isNullOrBlank()) {
+                            append("\n\n").append(outcome.hint)
+                        }
+                    }
+                    if (outcome.partial.isNullOrBlank()) {
+                        commitStreaming(serial, message, MessageStatus.ERROR, "error")
+                    } else {
+                        // Tokens already on screen stay; the error becomes an inline note instead
+                        // of wiping a half-finished answer.
+                        commitStreaming(
+                            serial,
+                            outcome.partial.orEmpty() + "\n\n⚠️ " + outcome.message,
+                            MessageStatus.SUCCESS,
+                            "partial"
+                        )
+                    }
+                }
             }
             _isStreaming.value = false
+            _streamingText.value = ""
+            reprobeHardware()
         }
     }
-}
 
+    /**
+     * The only place the message list is mutated during a turn. Idempotent and stale-write safe:
+     * a generation that was superseded (chat switched / stop pressed) simply does nothing.
+     */
+    private fun commitStreaming(
+        serial: Int,
+        text: String,
+        status: MessageStatus,
+        finishReason: String? = null
+    ) {
+        if (serial != generationSerial) return
+        var committed: List<ChatMessage>? = null
+        _messages.update { list ->
+            if (list.isEmpty()) return@update list
+            val last = list.last()
+            if (last.role != MessageRole.ASSISTANT) return@update list
+            val content = text.ifBlank { last.content }.ifBlank { "No text returned." }
+            val updated = list.dropLast(1) + last.copy(content = content, status = status)
+            committed = updated
+            updated
+        }
+        committed?.let { snapshot -> viewModelScope.launch { history.saveDraft(snapshot) } }
+        _lastFinishReason.value = finishReason
+    }
+
+    /** Exposes the effective (device-clamped) limits so the UI can show real numbers. */
+    fun effectiveLimits(): Pair<Int, Int> {
+        val policy = _runtimeSettings.value.policy
+        val advice = _budgetAdvice.value
+        return policy.effectiveMaxTokens(advice.maxOutputTokens) to
+            policy.effectiveContextBudget(advice.contextTokenBudget)
+    }
+
+    override fun onCleared() {
+        generationSerial++
+        activeJob?.cancel()
+        // Hand the weights back to the OS instead of pinning gigabytes after the screen closes.
+        if (_runtimeSettings.value.policy.releaseModelOnBackground) {
+            aiService.releaseNativeSession()
+        }
+        super.onCleared()
+    }
+}

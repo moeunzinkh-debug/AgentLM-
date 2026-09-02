@@ -10,6 +10,8 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -40,6 +42,10 @@ import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -55,6 +61,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -74,8 +82,15 @@ import com.example.model.AgentCatalog
 import com.example.model.ChatMessage
 import com.example.model.ChatSession
 import com.example.model.DeviceSpecs
+import com.example.model.EngineKind
+import com.example.model.EngineProfile
 import com.example.model.HFModelConfig
+import com.example.model.BudgetAdvice
+import com.example.model.HardwareInfo
 import com.example.model.ModelCatalog
+import com.example.model.RuntimeSettings
+import com.example.model.SafetyMode
+import com.example.ui.ChatViewModel
 import com.example.ui.theme.Amber400
 import com.example.ui.theme.Cyan300
 import com.example.ui.theme.Cyan400
@@ -119,25 +134,35 @@ fun SettingsSheet(
     onDeleteChatSession: (String) -> Unit,
     onDeleteAllHistory: () -> Unit,
     onClearCurrentChat: () -> Unit,
-    onOpenModelHub: () -> Unit
+    onOpenModelHub: () -> Unit,
+    viewModel: ChatViewModel,
+    initialTab: Int = 0
 ) {
     if (!isOpen) return
 
-    var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedTab by remember { mutableIntStateOf(initialTab) }
+    LaunchedEffect(isOpen, initialTab) {
+        if (isOpen) selectedTab = initialTab.coerceIn(0, 7)
+    }
     var showDeleteAllConfirm by remember { mutableStateOf(false) }
     var showCacheClearedToast by remember { mutableStateOf(false) }
 
+    val hardware by viewModel.hardware.collectAsState()
+
     val tabs = listOf(
-        "Hardware Detective",
+        "Hardware",
+        "Response Tuning",
+        "Engine & Keys",
         "GPU / CPU",
-        "Cache & Storage",
+        "Cache",
         "History",
         "Personas",
         "About"
     )
 
-    val ramRecommendations = remember(deviceSpecs) {
-        ModelCatalog.getRamRecommendations(deviceSpecs)
+    // Real numbers: measured free RAM + weight size + per-token KV growth of each model.
+    val ramRecommendations = remember(deviceSpecs, hardware) {
+        ModelCatalog.getRamRecommendations(deviceSpecs, hardware)
     }
 
     ModalBottomSheet(
@@ -177,13 +202,13 @@ fun SettingsSheet(
                     Spacer(modifier = Modifier.width(10.dp))
                     Column {
                         Text(
-                            text = "Settings & Device Detective",
+                            text = "Settings · Response Tuning",
                             fontSize = 17.sp,
                             fontWeight = FontWeight.Bold,
                             color = Slate100
                         )
                         Text(
-                            text = "Hardware diagnostics, memory analysis & storage",
+                            text = "Response limits, engines, keys & hardware diagnostics",
                             fontSize = 11.sp,
                             color = Slate400
                         )
@@ -262,21 +287,25 @@ fun SettingsSheet(
                         },
                         onOpenModelHub = onOpenModelHub
                     )
-                    1 -> GpuCpuTab(
+                    1 -> ResponseTuningTab(viewModel = viewModel, hardware = hardware)
+                    2 -> EngineKeysTab(viewModel = viewModel)
+                    3 -> GpuCpuTab(
                         deviceSpecs = deviceSpecs,
                         isGpuEnabled = isGpuEnabled,
                         cpuThreads = cpuThreads,
                         onToggleGpu = onToggleGpu,
-                        onSetCpuThreads = onSetCpuThreads
+                        onSetCpuThreads = onSetCpuThreads,
+                        hardware = hardware
                     )
-                    2 -> CacheStorageTab(
+                    4 -> CacheStorageTab(
                         cacheSizeBytes = cacheSizeBytes,
+                        modelStorageBytes = viewModel.modelStorageBytes.collectAsState().value,
                         onClearCache = {
                             onClearCache()
                             showCacheClearedToast = true
                         }
                     )
-                    3 -> HistoryTab(
+                    5 -> HistoryTab(
                         chatSessions = chatSessions,
                         onLoadSession = { session ->
                             onLoadChatSession(session)
@@ -289,14 +318,14 @@ fun SettingsSheet(
                         },
                         onDeleteAllConfirmRequest = { showDeleteAllConfirm = true }
                     )
-                    4 -> PersonasTab(
+                    6 -> PersonasTab(
                         currentAgent = currentAgent,
                         onSelectAgent = { agent ->
                             onSelectAgent(agent)
                             onDismiss()
                         }
                     )
-                    5 -> AboutTab()
+                    7 -> AboutTab(hardware = hardware, viewModel = viewModel)
                 }
             }
         }
@@ -564,7 +593,8 @@ private fun GpuCpuTab(
     isGpuEnabled: Boolean,
     cpuThreads: Int,
     onToggleGpu: (Boolean) -> Unit,
-    onSetCpuThreads: (Int) -> Unit
+    onSetCpuThreads: (Int) -> Unit,
+    hardware: HardwareInfo
 ) {
     Column(
         modifier = Modifier
@@ -601,8 +631,15 @@ private fun GpuCpuTab(
                 }
                 Spacer(modifier = Modifier.height(3.dp))
                 Text(
-                    text = if (isGpuEnabled) "Using Vulkan / NNAPI hardware shaders for ~3.5x token throughput"
-                    else "Using standard CPU fallback execution",
+                    text = when {
+                        isGpuEnabled && hardware.vulkanComputeLevel >= 42 ->
+                            "Vulkan compute level ${hardware.vulkanComputeLevel} detected — GPU delegate requested, " +
+                                "with automatic retry on CPU if the driver refuses."
+                        isGpuEnabled ->
+                            "No full Vulkan compute device found (level ${hardware.vulkanComputeLevel}) — " +
+                                "GPU requests will fall back to CPU on this SoC anyway."
+                        else -> "CPU execution only (${hardware.cores} logical cores available)."
+                    },
                     fontSize = 11.sp,
                     color = Slate400
                 )
@@ -636,7 +673,9 @@ private fun GpuCpuTab(
                 color = Slate100
             )
             Text(
-                text = "Number of active CPU cores dedicated to ONNX local tensor calculations (Device has ${deviceSpecs.cores} cores).",
+                text = "Threads handed to the local runtime (device reports ${deviceSpecs.cores} logical cores). " +
+                    "More threads than big cores makes decode *slower* and the UI jitterier — keep it at or below " +
+                    "${(hardware.cores - 1).coerceAtLeast(1)}.",
                 fontSize = 11.sp,
                 color = Slate400,
                 modifier = Modifier.padding(top = 2.dp, bottom = 10.dp)
@@ -693,7 +732,11 @@ private fun GpuCpuTab(
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "ONNX Runtime Mobile v1.20 (XNNPACK + Vulkan)",
+                    text = when {
+                        hardware.isTensorSoC -> "Tensor SoC: Gemma-family weights are pinned to 1 thread to avoid corrupted logits"
+                        hardware.powerSaveMode -> "Battery saver active: shorter replies + fewer threads"
+                        else -> "${hardware.chipset} • ${hardware.abi} • heap ceiling ${hardware.appHeapMb} MB"
+                    },
                     fontSize = 12.sp,
                     color = Slate300
                 )
@@ -708,6 +751,7 @@ private fun GpuCpuTab(
 @Composable
 private fun CacheStorageTab(
     cacheSizeBytes: Long,
+    modelStorageBytes: Long,
     onClearCache: () -> Unit
 ) {
     val formattedCache = remember(cacheSizeBytes) {
@@ -761,8 +805,35 @@ private fun CacheStorageTab(
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column {
+                    Text("Cached weights on disk", fontSize = 10.sp, color = Slate400)
+                    Text(
+                        text = "%.1f MB".format(modelStorageBytes / 1_048_576.0),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Emerald400
+                    )
+                }
+                Column(horizontalAlignment = Alignment.End) {
+                    Text("Model Hub storage", fontSize = 10.sp, color = Slate400)
+                    Text(
+                        text = if (modelStorageBytes > 0) "kept for offline use" else "nothing downloaded yet",
+                        fontSize = 10.sp,
+                        color = Slate300
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
             Text(
-                text = "Includes HuggingFace tokenizer token maps, temporary uploaded ZIP extractions, image tensors, and KV-cache buffers.",
+                text = "Clearing removes stale temp files and abandoned partial downloads only — " +
+                    "completed weight files stay on disk so offline inference keeps working. " +
+                    "Delete a model from Model Hub to reclaim its space.",
                 fontSize = 11.sp,
                 color = Slate400,
                 lineHeight = 16.sp
@@ -1026,7 +1097,12 @@ private fun PersonasTab(
 // TAB 5: ABOUT & PRIVACY
 // -----------------------------------------------------------------------------------------
 @Composable
-private fun AboutTab() {
+private fun AboutTab(
+    hardware: HardwareInfo,
+    viewModel: ChatViewModel
+) {
+    val settings by viewModel.runtimeSettings.collectAsState()
+    val activeEngine = settings.activeEngine()
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1065,7 +1141,7 @@ private fun AboutTab() {
                         color = Slate100
                     )
                     Text(
-                        text = "Version 2.5.0 • Mobile ONNX Edition",
+                        text = "v3.0.0 • Real streaming engines",
                         fontSize = 11.sp,
                         color = Slate400
                     )
@@ -1075,11 +1151,19 @@ private fun AboutTab() {
             Spacer(modifier = Modifier.height(14.dp))
 
             Text(
-                text = "An ultra-fast on-device AI assistant engineered with Alibaba's Qwen 2.5, Hugging Face ONNX Runtime, and multimodal code/ZIP analysis.",
+                text = "AgentLM answers only from a real model: token-streamed Gemini / Ollama / llama.cpp / " +
+                    "LM Studio / OpenRouter endpoints, or the weights you download from Hugging Face. " +
+                    "Nothing is scripted — if an engine cannot answer you get an explanation instead of a reply.",
                 fontSize = 12.sp,
                 color = Slate300,
                 lineHeight = 17.sp
             )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            InfoLine(label = "Active engine", value = activeEngine.label)
+            InfoLine(label = "Native runtime", value = viewModel.nativeEngineSummary)
+            InfoLine(label = "This device", value = "${"$"}{hardware.chipset} • ${"$"}{hardware.totalRamGb} GB RAM")
 
             Spacer(modifier = Modifier.height(12.dp))
 
@@ -1108,5 +1192,765 @@ private fun AboutTab() {
                 )
             }
         }
+    }
+}
+
+// =========================================================================================
+// TAB 1: RESPONSE TUNING — how long/often the model may talk, bounded by real hardware
+// =========================================================================================
+@Composable
+private fun ResponseTuningTab(
+    viewModel: ChatViewModel,
+    hardware: HardwareInfo
+) {
+    val settings by viewModel.runtimeSettings.collectAsState()
+    val advice by viewModel.budgetAdvice.collectAsState()
+    val policy = settings.policy
+
+    val deviceTokenCap = advice.maxOutputTokens
+    val effectiveMax = policy.effectiveMaxTokens(deviceTokenCap)
+    val effectiveCtx = policy.effectiveContextBudget(advice.contextTokenBudget)
+    val effectiveTurns = policy.effectiveHistoryTurns(advice.historyTurns)
+    val kvPerTurnMb = effectiveCtx * advice.kvPerTokenKb / 1024.0
+    val repaintsPerSecond = 1000.0 / policy.flushIntervalMs.coerceAtLeast(1.0)
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(440.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        // ---- verdict ----
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(14.dp))
+                .background(Slate900)
+                .border(
+                    1.dp,
+                    when (advice.verdict) {
+                        BudgetAdvice.Verdict.OPTIMAL -> Emerald400.copy(alpha = 0.4f)
+                        BudgetAdvice.Verdict.TIGHT -> Amber400.copy(alpha = 0.4f)
+                        BudgetAdvice.Verdict.OVER -> Rose500.copy(alpha = 0.4f)
+                    },
+                    RoundedCornerShape(14.dp)
+                )
+                .padding(13.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Device capacity verdict",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Slate100
+                    )
+                    Text(
+                        text = "${hardware.manufacturer} ${hardware.model} • ${hardware.totalRamMb} MB RAM " +
+                            "• ${hardware.availRamMb} MB free now",
+                        fontSize = 10.sp,
+                        color = Slate400
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(
+                            when (advice.verdict) {
+                                BudgetAdvice.Verdict.OPTIMAL -> Emerald400.copy(alpha = 0.18f)
+                                BudgetAdvice.Verdict.TIGHT -> Amber400.copy(alpha = 0.18f)
+                                BudgetAdvice.Verdict.OVER -> Rose500.copy(alpha = 0.18f)
+                            }
+                        )
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = when (advice.verdict) {
+                            BudgetAdvice.Verdict.OPTIMAL -> "HEADROOM OK"
+                            BudgetAdvice.Verdict.TIGHT -> "TIGHT"
+                            BudgetAdvice.Verdict.OVER -> "OVER BUDGET"
+                        },
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = when (advice.verdict) {
+                            BudgetAdvice.Verdict.OPTIMAL -> Emerald400
+                            BudgetAdvice.Verdict.TIGHT -> Amber400
+                            BudgetAdvice.Verdict.OVER -> Rose500
+                        }
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = "Weights ≈ ${advice.modelResidentMb} MB resident + ${advice.kvPerTokenKb} KB KV per token. " +
+                    "Free after load ≈ ${advice.freeRamAfterLoadMb} MB. Recommended ceiling for one reply: " +
+                    "$deviceTokenCap tokens.",
+                fontSize = 11.sp,
+                color = Slate300,
+                lineHeight = 15.sp
+            )
+
+            advice.warnings.forEach { warning ->
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.Top) {
+                    Icon(
+                        imageVector = Icons.Default.Warning,
+                        contentDescription = null,
+                        tint = Amber400,
+                        modifier = Modifier.size(13.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(text = warning, fontSize = 10.sp, color = Amber400, lineHeight = 14.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                MiniButton(
+                    label = "Apply for this phone",
+                    accent = true,
+                    onClick = { viewModel.applyDeviceAdvice() }
+                )
+                MiniButton(
+                    label = "Re-measure",
+                    accent = false,
+                    onClick = { viewModel.reprobeHardware() }
+                )
+            }
+        }
+
+        // ---- safety preset ----
+        TuningCard(
+            title = "Behaviour preset",
+            subtitle = "How aggressive the reply length and repaint cadence are allowed to be."
+        ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                SafetyMode.entries.forEach { mode ->
+                    val selected = policy.safetyMode == mode
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (selected) Cyan400 else Slate800)
+                            .clickable { viewModel.setSafetyMode(mode) }
+                            .padding(vertical = 8.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = mode.label,
+                            fontSize = 11.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                            color = if (selected) Slate950 else Slate300
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = policy.safetyMode.blurb,
+                fontSize = 10.sp,
+                color = Slate400
+            )
+        }
+
+        // ---- the three response limits ----
+        TuningCard(
+            title = "How much the model may answer",
+            subtitle = "0 = auto. Every value is clamped to what this phone can hold, so a reply can never outgrow RAM."
+        ) {
+            SliderRow(
+                label = "Max response tokens",
+                valueText = if (policy.maxOutputTokens == 0) "Auto → $effectiveMax" else "$effectiveMax",
+                value = effectiveMax.toFloat(),
+                range = 64f..2048f,
+                onValue = { viewModel.setMaxTokens(it.toInt()) }
+            )
+            Text(
+                text = "≈ ${effectiveMax * 4} characters per reply. Long answers are the #1 cause of a " +
+                    "stalled chat UI on mid-range phones.",
+                fontSize = 10.sp,
+                color = Slate400,
+                lineHeight = 13.sp
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            SliderRow(
+                label = "Prompt + attachment budget",
+                valueText = "$effectiveCtx tokens",
+                value = effectiveCtx.toFloat(),
+                range = 256f..8192f,
+                onValue = { viewModel.setContextBudget(it.toInt()) }
+            )
+            Text(
+                text = "Prefill cost ≈ %.1f MB KV. Attached file bodies are truncated to fit — this is the " +
+                    "other main freeze source.".format(kvPerTurnMb),
+                fontSize = 10.sp,
+                color = Slate400,
+                lineHeight = 13.sp
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            StepperRow(
+                label = "Conversation turns kept",
+                desc = "Older turns are dropped first when the budget runs out.",
+                value = effectiveTurns,
+                min = 0,
+                max = 16,
+                onChange = { viewModel.setHistoryTurns(it) }
+            )
+        }
+
+        // ---- streaming cadence ----
+        TuningCard(
+            title = "Streaming smoothness",
+            subtitle = "Tokens are coalesced before they reach Compose: fewer, bigger repaints instead of one per token."
+        ) {
+            SliderRow(
+                label = "Repaint interval",
+                valueText = "${policy.flushIntervalMs.toInt()} ms  (≈%.0f fps)".format(repaintsPerSecond),
+                value = policy.flushIntervalMs.toFloat(),
+                range = 30f..300f,
+                onValue = { viewModel.setFlushInterval(it.toLong()) }
+            )
+            SliderRow(
+                label = "Minimum new characters per repaint",
+                valueText = "${policy.minFlushChars}",
+                value = policy.minFlushChars.toFloat(),
+                range = 1f..80f,
+                onValue = { viewModel.setMinFlushChars(it.toInt()) }
+            )
+            SwitchRow(
+                label = "Render Markdown while streaming",
+                desc = "Off = plain text while typing, formatted when finished (cheapest). On = live formatting, costs re-parsing.",
+                checked = policy.renderMarkdownWhileStreaming,
+                onChange = { viewModel.setMarkdownWhileStreaming(it) }
+            )
+            SwitchRow(
+                label = "Auto-follow the bottom",
+                desc = "Scroll only while you are already near the bottom; scrolling up detaches immediately.",
+                checked = policy.autoFollowScroll,
+                onChange = { viewModel.setAutoFollowScroll(it) }
+            )
+        }
+
+        // ---- timeouts ----
+        TuningCard(
+            title = "Anti-hang guards",
+            subtitle = "A wedged engine can never hold the screen: each limit ends the turn and keeps the partial answer."
+        ) {
+            StepperRow(
+                label = "First-token (prefill) timeout",
+                desc = "Model loaded but silent for this long → stop and report.",
+                value = policy.prefillTimeoutSec,
+                min = 10,
+                max = 600,
+                step = 5,
+                unit = "s",
+                onChange = {
+                    viewModel.setTimeouts(it, policy.idleTokenTimeoutSec, policy.hardTimeoutSec)
+                }
+            )
+            StepperRow(
+                label = "Idle between tokens",
+                desc = "Gap inside one reply that counts as a stall.",
+                value = policy.idleTokenTimeoutSec,
+                min = 3,
+                max = 120,
+                step = 1,
+                unit = "s",
+                onChange = {
+                    viewModel.setTimeouts(policy.prefillTimeoutSec, it, policy.hardTimeoutSec)
+                }
+            )
+            StepperRow(
+                label = "Hard wall-clock limit",
+                desc = "Absolute maximum duration of a single answer.",
+                value = policy.hardTimeoutSec,
+                min = 30,
+                max = 1800,
+                step = 30,
+                unit = "s",
+                onChange = {
+                    viewModel.setTimeouts(policy.prefillTimeoutSec, policy.idleTokenTimeoutSec, it)
+                }
+            )
+            SwitchRow(
+                label = "Unload weights when idle",
+                desc = "Releases several hundred MB of mapped weights after the keep-alive window so the OS never kills the app mid-answer.",
+                checked = policy.releaseModelOnBackground,
+                onChange = { viewModel.setReleaseModelOnBackground(it) }
+            )
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+    }
+}
+
+// =========================================================================================
+// TAB 2: ENGINE & KEYS — where the answers actually come from
+// =========================================================================================
+@Composable
+private fun EngineKeysTab(viewModel: ChatViewModel) {
+    val settings by viewModel.runtimeSettings.collectAsState()
+    val pings by viewModel.enginePing.collectAsState()
+    val active = settings.activeEngine()
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(440.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text(
+            text = "Pick one source of truth for replies. AgentLM has no scripted fallback: if the engine " +
+                "cannot answer, the message shows the real error plus how to fix it.",
+            fontSize = 11.sp,
+            color = Slate400,
+            lineHeight = 15.sp
+        )
+
+        settings.engines.forEach { profile ->
+            val isActive = profile.id == active.id
+            val ping = pings[profile.id]
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(if (isActive) CyanGlow else Slate900)
+                    .border(1.dp, if (isActive) Cyan400 else GlassBorder, RoundedCornerShape(14.dp))
+                    .clickable { viewModel.setActiveEngine(profile.id) }
+                    .padding(12.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = when (profile.kind) {
+                            EngineKind.LOCAL_NATIVE -> Icons.Default.Memory
+                            EngineKind.GEMINI -> Icons.Default.Psychology
+                            EngineKind.OPENAI_COMPAT -> Icons.Default.Public
+                        },
+                        contentDescription = null,
+                        tint = if (profile.isReady) Cyan400 else Slate400,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = profile.label,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Slate100
+                        )
+                        Text(
+                            text = when {
+                                profile.kind == EngineKind.LOCAL_NATIVE -> viewModel.nativeEngineSummary
+                                profile.baseUrl.isNotBlank() -> profile.baseUrl
+                                else -> profile.kind.label
+                            },
+                            fontSize = 10.sp,
+                            color = Slate400,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(
+                                if (profile.isReady) Emerald400.copy(alpha = 0.16f)
+                                else Rose500.copy(alpha = 0.16f)
+                            )
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = if (profile.isReady) "READY" else "SETUP",
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (profile.isReady) Emerald400 else Rose500
+                        )
+                    }
+                }
+
+                if (ping != null) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = (if (ping.ok) "✓ " else "✗ ") + ping.message,
+                        fontSize = 10.sp,
+                        color = if (ping.ok) Emerald400 else Rose500
+                    )
+                    ping.detail?.let {
+                        Text(text = it, fontSize = 9.sp, color = Slate400, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+        }
+
+        // ---- editor for the selected profile ----
+        TuningCard(
+            title = "Configure ${active.label}",
+            subtitle = if (active.kind == EngineKind.LOCAL_NATIVE)
+                "Runs the weight file you downloaded in Model Hub, on this device."
+            else
+                "Works with Ollama (http://PC-IP:11434/v1), llama.cpp server (-c 4096 --host 0.0.0.0), " +
+                    "LM Studio, vLLM, OpenRouter, Groq or the Hugging Face router."
+        ) {
+            var baseUrl by remember(active.id) { mutableStateOf(active.baseUrl) }
+            var modelId by remember(active.id) { mutableStateOf(active.modelId) }
+            var apiKey by remember(active.id) { mutableStateOf(active.apiKey) }
+
+            if (active.kind != EngineKind.LOCAL_NATIVE) {
+                LabeledField(
+                    label = "Base URL",
+                    value = baseUrl,
+                    placeholder = "http://192.168.1.20:11434/v1",
+                    onValueChange = { baseUrl = it }
+                )
+                LabeledField(
+                    label = "Model id / tag",
+                    value = modelId,
+                    placeholder = "qwen2.5:0.5b  •  gemini-2.5-flash",
+                    onValueChange = { modelId = it }
+                )
+                LabeledField(
+                    label = "API key",
+                    value = apiKey,
+                    placeholder = "leave empty for local servers",
+                    onValueChange = { apiKey = it }
+                )
+
+                if (active.kind == EngineKind.GEMINI) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = if (EngineProfile.buildTimeGeminiKey.isNotEmpty())
+                            "A GEMINI_API_KEY was baked in from .env at build time — leave this field " +
+                            "empty to use it, or type a key to override."
+                        else
+                            "No key available. Type one here, or put GEMINI_API_KEY in .env and rebuild.",
+                        fontSize = 10.sp,
+                        color = if (EngineProfile.buildTimeGeminiKey.isNotEmpty()) Emerald400 else Amber400,
+                        lineHeight = 14.sp
+                    )
+                }
+
+                if (active.needsCleartext) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Plain HTTP to a LAN address is blocked in release builds by " +
+                            "res/xml/network_security_config.xml. Use https://, or install a debug " +
+                            "build while testing Ollama / llama.cpp on your machine.",
+                        fontSize = 10.sp,
+                        color = Amber400,
+                        lineHeight = 14.sp
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MiniButton(
+                        label = "Save",
+                        accent = true,
+                        onClick = {
+                            viewModel.saveEngineProfile(
+                                active.copy(
+                                    baseUrl = baseUrl.trim(),
+                                    modelId = modelId.trim(),
+                                    apiKey = apiKey.trim()
+                                )
+                            )
+                        }
+                    )
+                    MiniButton(
+                        label = "Test connection",
+                        accent = false,
+                        onClick = { viewModel.testEngine(active.id) }
+                    )
+                }
+            } else {
+                Text(
+                    text = viewModel.nativeEngineSummary,
+                    fontSize = 11.sp,
+                    color = Slate300,
+                    lineHeight = 15.sp
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+            Text(
+                text = "Preferred quantization for downloads",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Slate100
+            )
+            Spacer(modifier = Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("Q2_K", "Q3_K_M", "Q4_K_S", "Q4_K_M", "Q5_K_M", "Q8_0").chunked(3).forEach { rowQuants ->
+                    Row(modifier = Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        rowQuants.forEach { quant ->
+                            val selected = settings.preferredHfQuant == quant
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (selected) Cyan400 else Slate800)
+                                    .clickable {
+                                        viewModel.updateSettings { current ->
+                                            current.copy(
+                                                preferredHfQuant = quant,
+                                                policy = current.policy.copy(quantization = quant)
+                                            )
+                                        }
+                                    }
+                                    .padding(vertical = 7.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = quant,
+                                    fontSize = 10.sp,
+                                    color = if (selected) Slate950 else Slate300,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "Model Hub picks the largest file that still fits the RAM budget measured above, " +
+                    "so a download cannot leave the app short of memory while it streams.",
+                fontSize = 10.sp,
+                color = Slate400,
+                lineHeight = 14.sp
+            )
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+    }
+}
+
+// ---- shared bits for the two new tabs ----
+@Composable
+private fun TuningCard(
+    title: String,
+    subtitle: String,
+    content: @Composable () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Slate900)
+            .border(1.dp, GlassBorder, RoundedCornerShape(14.dp))
+            .padding(13.dp)
+    ) {
+        Text(
+            text = title,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            color = Slate100
+        )
+        Text(
+            text = subtitle,
+            fontSize = 10.sp,
+            color = Slate400,
+            lineHeight = 13.sp,
+            modifier = Modifier.padding(top = 2.dp, bottom = 10.dp)
+        )
+        content()
+    }
+}
+
+@Composable
+private fun SliderRow(
+    label: String,
+    valueText: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onValue: (Float) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(text = label, fontSize = 11.sp, color = Slate300)
+            Text(
+                text = valueText,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color = Cyan300
+            )
+        }
+        Slider(
+            value = value.coerceIn(range.start, range.endInclusive),
+            onValueChange = onValue,
+            valueRange = range,
+            colors = SliderDefaults.colors(
+                thumbColor = Cyan400,
+                activeTrackColor = Cyan400,
+                inactiveTrackColor = Slate800
+            ),
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+@Composable
+private fun StepperRow(
+    label: String,
+    desc: String,
+    value: Int,
+    min: Int,
+    max: Int,
+    onChange: (Int) -> Unit,
+    step: Int = 1,
+    unit: String = ""
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(text = label, fontSize = 11.sp, color = Slate300)
+                Text(text = desc, fontSize = 9.sp, color = Slate400, lineHeight = 12.sp)
+            }
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Slate800)
+                    .clickable { onChange((value - step).coerceIn(min, max)) }
+                    .padding(horizontal = 11.dp, vertical = 6.dp)
+            ) {
+                Text(text = "−", fontSize = 14.sp, color = Slate100, fontWeight = FontWeight.Bold)
+            }
+            Text(
+                text = "$value$unit",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = Cyan300,
+                modifier = Modifier.padding(horizontal = 8.dp)
+            )
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Slate800)
+                    .clickable { onChange((value + step).coerceIn(min, max)) }
+                    .padding(horizontal = 11.dp, vertical = 6.dp)
+            ) {
+                Text(text = "+", fontSize = 14.sp, color = Slate100, fontWeight = FontWeight.Bold)
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+    }
+}
+
+@Composable
+private fun SwitchRow(
+    label: String,
+    desc: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(text = label, fontSize = 11.sp, color = Slate100, fontWeight = FontWeight.Medium)
+            Text(text = desc, fontSize = 9.sp, color = Slate400, lineHeight = 12.sp)
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        Switch(
+            checked = checked,
+            onCheckedChange = onChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = Slate950,
+                checkedTrackColor = Cyan400,
+                uncheckedThumbColor = Slate400,
+                uncheckedTrackColor = Slate800
+            )
+        )
+    }
+}
+
+@Composable
+private fun MiniButton(
+    label: String,
+    accent: Boolean,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(9.dp))
+            .background(if (accent) Cyan400 else GlassSurface)
+            .border(1.dp, if (accent) Cyan400 else GlassBorder, RoundedCornerShape(9.dp))
+            .clickable { onClick() }
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+    ) {
+        Text(
+            text = label,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (accent) Slate950 else Slate300
+        )
+    }
+}
+
+@Composable
+private fun LabeledField(
+    label: String,
+    value: String,
+    placeholder: String,
+    onValueChange: (String) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+        Text(text = label, fontSize = 10.sp, color = Slate400, modifier = Modifier.padding(bottom = 3.dp))
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            singleLine = true,
+            placeholder = { Text(text = placeholder, fontSize = 11.sp, color = Slate400) },
+            textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp, color = Slate100),
+            modifier = Modifier.fillMaxWidth(),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Cyan400,
+                unfocusedBorderColor = GlassBorder,
+                focusedTextColor = Slate100,
+                unfocusedTextColor = Slate100,
+                cursorColor = Cyan400
+            )
+        )
+    }
+}
+
+@Composable
+private fun InfoLine(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(text = label, fontSize = 10.sp, color = Slate400)
+        Text(
+            text = value,
+            fontSize = 10.sp,
+            color = Slate300,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.width(190.dp)
+        )
     }
 }

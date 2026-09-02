@@ -21,8 +21,24 @@ data class ModelDownloadProgress(
     val progress: Float = 0f, // 0.0 to 1.0
     val downloadedBytes: Long = 0L,
     val totalBytes: Long = 0L,
-    val speedMbps: Double = 0.0
-)
+    /** Real measured throughput in MB/s (updated on a time budget, not per chunk). */
+    val speedMbps: Double = 0.0,
+    val speedBytesPerSec: Long = 0L,
+    val etaSeconds: Long = -1L,
+    val isPaused: Boolean = false,
+    val error: String? = null,
+    val fileName: String = "",
+    val filePath: String = ""
+) {
+    val hasPartialData: Boolean get() = isPaused && downloadedBytes > 0L
+
+    fun etaLabel(): String {
+        if (etaSeconds <= 0L) return "--:--"
+        val m = etaSeconds / 60
+        val sec = etaSeconds % 60
+        return "%d:%02d".format(m, sec)
+    }
+}
 
 data class HFModelConfig(
     val id: String,
@@ -36,7 +52,13 @@ data class HFModelConfig(
     val minTier: String = "medium",
     val supportsVision: Boolean = false,
     val supportsFiles: Boolean = true,
-    val sizeBytes: Long = 367001600L
+    val sizeBytes: Long = 367001600L,
+    /** Weight container actually resolved on Hugging Face: "gguf" | "litertlm" | "task" | "onnx". */
+    val kind: String = "gguf",
+    /** Exact file name inside the repo that was chosen for this device's RAM budget. */
+    val preferredFile: String = "",
+    /** True when [preferredFile] matched the quantization recommended for this device. */
+    val isQuantRecommended: Boolean = false
 )
 
 data class RamModelRecommendation(
@@ -50,6 +72,15 @@ data class RamModelRecommendation(
 
 data class DeviceSpecs(
     val hasHardwareGpu: Boolean,
+    /** SoC string from Build.SOC_MANUFACTURER / SOC_MODEL (API 31+) or Build.HARDWARE. */
+    val chipset: String = "",
+    val deviceModel: String = "",
+    val deviceAbis: List<String> = emptyList(),
+    /** Real measured memory, in MB (not the JVM heap ceiling). */
+    val totalRamMb: Long = 0L,
+    val availRamMb: Long = 0L,
+    val freeDiskMb: Long = 0L,
+    val vulkanComputeLevel: Int = 0,
     val gpuRenderer: String = "Vulkan / Adreno NPU",
     val cpuArch: String = "ARM64-v8a",
     val cores: Int,
@@ -277,31 +308,47 @@ object ModelCatalog {
 
     val DEFAULT_MODEL = PRESET_MODELS[0]
 
-    fun detectDevice(): DeviceSpecs {
-        val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(4)
-        val maxMemoryMB = (Runtime.getRuntime().maxMemory() / (1024 * 1024)).toInt()
-        val totalRamGB = when {
-            maxMemoryMB > 512 -> 8
-            maxMemoryMB > 256 -> 6
-            else -> 4
-        }
-        val availableRamGB = (totalRamGB * 0.65).toInt().coerceAtLeast(2)
-        val tier = if (totalRamGB >= 6 && cores >= 6) "high" else if (cores >= 4) "medium" else "low"
+    /**
+     * Builds the device profile from **measured** values (ActivityManager / Build / StatFs)
+     * instead of guessing RAM from the JVM heap ceiling.
+     */
+    fun deviceSpecsFrom(hardware: HardwareInfo): DeviceSpecs {
+        val totalRamGB = hardware.totalRamGb
+        val availableRamGB = (hardware.availRamMb / 1024.0).toInt().coerceAtLeast(1)
+        val tier = hardware.tier
         val recId = when (tier) {
-            "high" -> "onnx-community/Qwen2.5-0.5B-Instruct"
-            "low" -> "onnx-community/SmolLM2-135M-Instruct"
-            else -> "onnx-community/Qwen2.5-0.5B-Instruct"
+            "high" -> DEFAULT_MODEL.id
+            "low" -> PRESET_MODELS.firstOrNull { it.minTier == "low" }?.id ?: DEFAULT_MODEL.id
+            else -> PRESET_MODELS.firstOrNull { it.sizeBytes <= 400_000_000L }?.id ?: DEFAULT_MODEL.id
         }
-        val reason = when (tier) {
-            "high" -> "Detected flagship multicore hardware ($cores Cores, $totalRamGB GB RAM). Optimal for Qwen 2.5 and Multimodal models."
-            "low" -> "Detected battery-saver profile. Recommended lightweight SmolLM2 or Qwen 0.5B for fast responsiveness."
-            else -> "Detected balanced mobile profile ($cores Cores, $totalRamGB GB RAM). Recommended Qwen 2.5 0.5B for fast reasoning."
+        val renderer = when {
+            !hardware.hasVulkan -> "CPU only (no Vulkan device found)"
+            hardware.vulkanComputeLevel >= 42 -> "Vulkan ${hardware.vulkanComputeLevel} compute-capable GPU"
+            else -> "Vulkan ${hardware.vulkanComputeLevel} (limited compute — CPU preferred)"
+        }
+        val reason = buildString {
+            append("${hardware.manufacturer} ${hardware.model} • ${hardware.chipset} • ")
+            append("${hardware.cores} cores • ${hardware.totalRamGb} GB RAM (~${hardware.availRamGb} GB free)")
+            if (hardware.powerSaveMode) append(" • battery saver ON")
+            if (hardware.thermalStatus >= 3) append(" • thermally throttled")
+            append(". ").append(when (tier) {
+                "high" -> "Can hold a 1-2B Q4 model with a multi-turn KV cache without swapping."
+                "low" -> "Keep answers short and prefer sub-400MB weights to avoid UI stalls."
+                else -> "Best served by a sub-1B Q4 model with clamped output length."
+            })
         }
         return DeviceSpecs(
-            hasHardwareGpu = true,
-            gpuRenderer = "Vulkan / Adreno NPU",
-            cpuArch = "ARM64-v8a",
-            cores = cores,
+            hasHardwareGpu = hardware.vulkanComputeLevel >= 42,
+            chipset = hardware.chipset,
+            deviceModel = "${hardware.manufacturer} ${hardware.model}",
+            deviceAbis = listOf(hardware.abi),
+            totalRamMb = hardware.totalRamMb,
+            availRamMb = hardware.availRamMb,
+            freeDiskMb = hardware.freeDiskMb,
+            vulkanComputeLevel = hardware.vulkanComputeLevel,
+            gpuRenderer = renderer,
+            cpuArch = hardware.abi,
+            cores = hardware.cores,
             memoryEstimateGB = totalRamGB,
             totalRamGB = totalRamGB,
             availableRamGB = availableRamGB,
@@ -311,26 +358,30 @@ object ModelCatalog {
         )
     }
 
-    fun getRamRecommendations(specs: DeviceSpecs): List<RamModelRecommendation> {
-        val ram = specs.totalRamGB
+    fun getRamRecommendations(
+        specs: DeviceSpecs,
+        hardware: HardwareInfo? = null
+    ): List<RamModelRecommendation> {
+        val free = if (specs.availRamMb > 0) specs.availRamMb else specs.totalRamGB * 1024L / 2
         return PRESET_MODELS.map { model ->
-            val required = when {
-                model.sizeBytes > 1000_000_000L -> 6
-                model.sizeBytes > 500_000_000L -> 4
-                model.sizeBytes > 200_000_000L -> 3
-                else -> 2
-            }
-            val isOptimal = ram >= required + 1
-            val isSupported = ram >= required
+            // Real weight size + measured KV-cache growth, not a size bucket guess.
+            val advice = hardware?.let { ResponseBudgetAdvisor.advise(it, model) }
+            val residentMb = advice?.modelResidentMb
+                ?: (model.sizeBytes / 1_048_576L * 1.3L).coerceAtLeast(32L)
+            val required = ((residentMb + 420L) / 1024.0).let { kotlin.math.ceil(it.toDouble()) }.toInt().coerceAtLeast(2)
+            val fits = free >= residentMb + 420L
+            val isOptimal = free >= residentMb + 1_100L
+            val isSupported = fits
+            val ram = specs.totalRamGB
             val statusLabel = when {
-                isOptimal -> "Optimal (Fastest)"
-                isSupported -> "Supported (Normal)"
-                else -> "High RAM (May throttle)"
+                isOptimal -> "Optimal (fast KV cache)"
+                isSupported -> "Supported (tight)"
+                else -> "Over budget (will stall)"
             }
             val tip = when {
-                isOptimal -> "Device has plenty of RAM headroom for fast KV-caching."
-                isSupported -> "Runs stably on your ${ram}GB device."
-                else -> "Needs ~${required}GB free RAM for peak multi-turn context."
+                isOptimal -> "~${residentMb} MB resident leaves ${(free - residentMb) / 1024} GB spare for KV + UI."
+                isSupported -> "Only ~${free} MB free vs ${residentMb} MB resident — clamp output length."
+                else -> "Needs ~${required} GB free RAM. Use ${advice?.quantization ?: "a smaller"} quantization instead."
             }
             RamModelRecommendation(
                 model = model,

@@ -60,6 +60,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
@@ -89,10 +90,12 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -109,6 +112,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -171,7 +175,16 @@ fun ChatScreen(
     val hfSearchResults by viewModel.hfSearchResults.collectAsState()
     val isSearchingHf by viewModel.isSearchingHf.collectAsState()
 
+    val streamingText by viewModel.streamingText.collectAsState()
+    val streamStats by viewModel.streamStats.collectAsState()
+    val settings by viewModel.runtimeSettings.collectAsState()
+    val lastFinishReason by viewModel.lastFinishReason.collectAsState()
+    var settingsInitialTab by remember { mutableIntStateOf(0) }
+
     var showSettingsSheet by remember { mutableStateOf(false) }
+    LaunchedEffect(showSettingsSheet) {
+        if (!showSettingsSheet) settingsInitialTab = 0
+    }
     var showModelSheet by remember { mutableStateOf(false) }
     var showAttachmentDialog by remember { mutableStateOf(false) }
 
@@ -198,8 +211,28 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(messages.size, messages.lastOrNull()?.content?.length) {
-        if (messages.isNotEmpty()) {
+    // -----------------------------------------------------------------------------------------
+    // Freeze-proof autoscroll.
+    //
+    // The old code called animateScrollToItem for *every* emitted token, restarting an
+    // in-flight scroll animation thousands of times per reply. Here we follow only while the
+    // list is actually at the bottom, use a non-animated jump while streaming, and rely on the
+    // coalesced snapshot (≈1 update per policy.flushIntervalMs) as the natural throttle.
+    // -----------------------------------------------------------------------------------------
+    val isNearBottom = remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()
+            lastVisible == null || lastVisible.index >= info.totalItemsCount - 2
+        }
+    }
+    LaunchedEffect(messages.size, streamingText.length, isStreaming) {
+        if (messages.isEmpty()) return@LaunchedEffect
+        if (!settings.policy.autoFollowScroll) return@LaunchedEffect
+        if (isStreaming && !isNearBottom.value) return@LaunchedEffect
+        if (isStreaming) {
+            listState.scrollToItem(messages.size - 1)
+        } else {
             listState.animateScrollToItem(messages.size - 1)
         }
     }
@@ -253,12 +286,81 @@ fun ChatScreen(
                             verticalArrangement = Arrangement.spacedBy(14.dp)
                         ) {
                             itemsIndexed(messages, key = { _, msg -> msg.id }) { index, message ->
+                                val streamingHere =
+                                    isStreaming && index == messages.size - 1 &&
+                                        message.role == MessageRole.ASSISTANT
                                 MessageItem(
-                                    message = message,
-                                    isStreaming = isStreaming && index == messages.size - 1 && message.role == MessageRole.ASSISTANT
+                                    // The live text comes from a separate StateFlow, so the list
+                                    // itself keeps a stable size while tokens arrive.
+                                    message = if (streamingHere && message.content.isEmpty()) {
+                                        message.copy(content = streamingText)
+                                    } else {
+                                        message
+                                    },
+                                    isStreaming = streamingHere,
+                                    renderMarkdown = !streamingHere ||
+                                        settings.policy.renderMarkdownWhileStreaming,
+                                    stats = if (streamingHere) streamStats else null,
+                                    engineLabel = settings.activeEngine().label,
+                                    tokenCapHint = viewModel.effectiveLimits().let { (maxTok, ctx) ->
+                                        "≤%d tokens out • %d token context".format(maxTok, ctx)
+                                    }
                                 )
                             }
                         }
+                    }
+                }
+
+                // Why did that answer stop? Truncation comes from the device-derived caps, so the
+                // hint points straight at the control that owns it instead of leaving the user
+                // guessing that the app "froze" or "cut off".
+                if (!isStreaming && lastFinishReason != null &&
+                    lastFinishReason in listOf("length-cap", "truncated", "stopped", "partial")
+                ) {
+                    val capped = lastFinishReason == "length-cap" || lastFinishReason == "truncated"
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp)
+                            .padding(bottom = 6.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (capped) Amber400.copy(alpha = 0.10f) else Slate900)
+                            .border(
+                                1.dp,
+                                if (capped) Amber400.copy(alpha = 0.35f) else GlassBorder,
+                                RoundedCornerShape(10.dp)
+                            )
+                            .clickable {
+                                settingsInitialTab = 1
+                                showSettingsSheet = true
+                            }
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Info,
+                            contentDescription = null,
+                            tint = if (capped) Amber400 else Slate400,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (capped)
+                                "Answer hit its token cap — open Response Tuning to raise it for this device"
+                            else
+                                "Generation was stopped early — tap to review the anti-hang limits",
+                            fontSize = 11.sp,
+                            color = Slate300,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            text = "Adjust",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Cyan300
+                        )
                     }
                 }
 
@@ -332,7 +434,9 @@ fun ChatScreen(
         onOpenModelHub = {
             showSettingsSheet = false
             showModelSheet = true
-        }
+        },
+        viewModel = viewModel,
+        initialTab = settingsInitialTab
     )
 
     // Model Hub Bottom Sheet (with local download, live HF search & start model buttons)
@@ -348,6 +452,8 @@ fun ChatScreen(
         onDismiss = { showModelSheet = false },
         onSelectModel = { model -> viewModel.selectModel(model) },
         onDownloadModel = { model -> viewModel.startDownloadModel(model) },
+        onPauseDownload = { id -> viewModel.pauseDownload(id) },
+        onCancelDownload = { id -> viewModel.cancelDownload(id) },
         onStartUsingModel = { model -> viewModel.startUsingDownloadedModel(model) },
         onDeleteDownloadedModel = { modelId -> viewModel.deleteDownloadedModel(modelId) }
     )
@@ -645,10 +751,44 @@ fun ChatTopBar(
     }
 }
 
+/**
+ * Live generation telemetry: flush count is what proves the UI is being coalesced
+ * (e.g. "312 tok/s • 1.9k chars • 24 repaints" instead of 1.9k recompositions).
+ */
+@Composable
+fun StreamingTelemetry(stats: com.example.service.ResponseStreamer.Stats) {
+    val phase = when {
+        stats.phase == "connecting" -> "connecting…"
+        stats.phase == "loading-weights" -> "mapping weights…"
+        stats.phase == "decoding" -> "prefilling…"
+        stats.phase == "streaming" -> "streaming"
+        stats.phase == "timeout" -> "stalled — closing turn"
+        stats.phase.startsWith("fallback:") -> "switching engine"
+        stats.phase.startsWith("local-litertlm") -> "on-device"
+        else -> stats.phase
+    }
+    Text(
+        text = "%s • %d tok • %.0f tok/s • %d repaints".format(
+            phase,
+            stats.tokensOut,
+            stats.tokensPerSecond,
+            stats.flushes
+        ),
+        fontSize = 10.sp,
+        color = Slate400,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis
+    )
+}
+
 @Composable
 fun MessageItem(
     message: ChatMessage,
-    isStreaming: Boolean
+    isStreaming: Boolean,
+    renderMarkdown: Boolean = true,
+    stats: com.example.service.ResponseStreamer.Stats? = null,
+    engineLabel: String = "",
+    tokenCapHint: String = ""
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -776,15 +916,24 @@ fun MessageItem(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Text(
-                                text = "Reasoning & generating tokens",
-                                fontSize = 13.sp,
-                                color = Slate400,
-                                fontWeight = FontWeight.Medium
-                            )
+                            Column {
+                                Text(
+                                    text = "Reasoning & generating tokens",
+                                    fontSize = 13.sp,
+                                    color = Slate400,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                if (engineLabel.isNotBlank()) {
+                                    Text(
+                                        text = "$engineLabel • $tokenCapHint",
+                                        fontSize = 10.sp,
+                                        color = Slate400.copy(alpha = 0.8f)
+                                    )
+                                }
+                            }
                             BouncingThinkingDots()
                         }
-                    } else {
+                    } else if (renderMarkdown) {
                         MarkdownView(
                             text = message.content,
                             textColor = Slate100
@@ -793,6 +942,22 @@ fun MessageItem(
                             Spacer(modifier = Modifier.height(6.dp))
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 PulsingCursor()
+                                if (stats != null) StreamingTelemetry(stats)
+                            }
+                        }
+                    } else {
+                        // Cheaper path while tokens pour in: no Markdown parse per repaint.
+                        Text(
+                            text = message.content,
+                            fontSize = 14.sp,
+                            lineHeight = 21.sp,
+                            color = Slate100
+                        )
+                        if (isStreaming) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                PulsingCursor()
+                                if (stats != null) StreamingTelemetry(stats)
                             }
                         }
                     }
@@ -813,7 +978,11 @@ fun MessageItem(
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = if (message.isLocalExecution) "Local ONNX Compute" else "Accelerated Inference",
+                                    text = when {
+                                        message.isLocalExecution -> "On-device weights"
+                                        engineLabel.isNotBlank() -> engineLabel
+                                        else -> "Remote model"
+                                    },
                                     fontSize = 10.sp,
                                     color = Slate400
                                 )
