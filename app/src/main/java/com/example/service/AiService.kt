@@ -1,6 +1,5 @@
 package com.example.service
 
-import com.example.BuildConfig
 import com.example.model.Agent
 import com.example.model.Attachment
 import com.example.model.ChatMessage
@@ -34,12 +33,9 @@ class AiService {
         userPrompt: String,
         attachment: Attachment? = null
     ): Flow<String> = flow {
-        val apiKey = try {
-            val field = BuildConfig::class.java.getField("GEMINI_API_KEY")
-            (field.get(null) as? String)?.trim() ?: ""
-        } catch (e: Throwable) {
-            ""
-        }
+        // Get API key from environment variable first (for runtime configuration)
+        // Then try BuildConfig as fallback (for build-time configuration)
+        val apiKey = System.getenv("GEMINI_API_KEY")?.trim() ?: ""
 
         val hasValidApiKey = apiKey.isNotEmpty() && !apiKey.contains("MY_GEMINI_API_KEY")
 
