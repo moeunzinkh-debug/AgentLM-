@@ -39,19 +39,43 @@ jobs:
         with:
           gradle-version: "9.3.1"
 
-      - name: Compile debug sources
+      - name: Compile main + androidTest sources
         run: |
           set +e
-          gradle :app:compileDebugKotlin --console=plain --no-daemon --stacktrace > /tmp/out.log 2>&1
-          echo "gradle_exit=$?" >> /tmp/out.log
+          gradle :app:compileDebugKotlin :app:compileDebugAndroidTestKotlin \
+            --console=plain --no-daemon --stacktrace > /tmp/out.log 2>&1
+          echo "compile_exit=$?" >> /tmp/out.log
           {
             echo "--- compiler errors ---"
-            grep -E "^e: |^w: .*(unresolved|expecting)" /tmp/out.log | head -n 120
+            grep -E "^e: |^w: .*(unresolved|expecting)" /tmp/out.log | head -n 100
             echo "--- what went wrong ---"
-            grep -n -A 12 "What went wrong" /tmp/out.log | head -n 80
-            echo "--- tail ---"
-            tail -n 40 /tmp/out.log
+            grep -n -A 10 "What went wrong" /tmp/out.log | head -n 50
+            echo "--- result ---"
+            grep -E "BUILD (SUCCESSFUL|FAILED)" /tmp/out.log
+            tail -n 3 /tmp/out.log
           } > /tmp/report.log
+          exit 0
+
+      - name: Run unit tests (Robolectric)
+        run: |
+          set +e
+          gradle :app:testDebugUnitTest --console=plain --no-daemon > /tmp/test.log 2>&1
+          echo "test_exit=$?" >> /tmp/test.log
+          {
+            echo "--- unit tests ---"
+            grep -E "FAILED|tests? completed|^e: " /tmp/test.log | head -n 60
+            echo "--- failures ---"
+            grep -n -B 2 -A 22 "^.*> Task :app:testDebugUnitTest FAILED\|Test.* > .*FAILED" /tmp/test.log | head -n 160
+            for f in app/build/test-results/testDebugUnitTest/*.xml; do
+              [ -f "$f" ] || continue
+              grep -o '<testcase name="[^"]*"' "$f" | head -n 20
+              grep -A 18 "<failure" "$f" | head -n 120
+            done
+            echo "--- what went wrong ---"
+            grep -n -A 8 "What went wrong" /tmp/test.log | head -n 40
+            grep -E "BUILD (SUCCESSFUL|FAILED)" /tmp/test.log
+            tail -n 2 /tmp/test.log
+          } >> /tmp/report.log
           exit 0
 
       - name: Report as PR comment
