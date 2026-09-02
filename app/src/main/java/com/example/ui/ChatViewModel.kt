@@ -14,7 +14,6 @@ import com.example.model.DownloadStatus
 import com.example.model.EngineProfile
 import com.example.model.HFModelConfig
 import com.example.model.HardwareInfo
-import com.example.model.HardwareProbe
 import com.example.model.MessageRole
 import com.example.model.MessageStatus
 import com.example.model.ModelCatalog
@@ -75,7 +74,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _streamStats = MutableStateFlow<ResponseStreamer.Stats?>(null)
     val streamStats: StateFlow<ResponseStreamer.Stats?> = _streamStats.asStateFlow()
 
-    private val _hardware = MutableStateFlow(HardwareProbe.probe(app))
+    private val _hardware = MutableStateFlow(HardwareInfo.probe(app))
     val hardware: StateFlow<HardwareInfo> = _hardware.asStateFlow()
 
     private val _deviceSpecs = MutableStateFlow(ModelCatalog.deviceSpecsFrom(_hardware.value))
@@ -201,7 +200,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun reprobeHardware() {
         viewModelScope.launch(Dispatchers.Default) {
-            val fresh = HardwareProbe.probe(app)
+            val fresh = HardwareInfo.probe(app)
             _hardware.value = fresh
             _deviceSpecs.value = ModelCatalog.deviceSpecsFrom(fresh)
             refreshAdvice()

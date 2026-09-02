@@ -18,7 +18,7 @@ internal object EngineHttp {
     fun streaming(readTimeoutSec: Int): OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(readTimeoutSec.coerceIn(20, 300), TimeUnit.SECONDS)
+        .readTimeout(readTimeoutSec.coerceIn(20, 300).toLong(), TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .connectionPool(okhttp3.ConnectionPool(4, 5, TimeUnit.MINUTES))
         .build()

@@ -112,7 +112,8 @@ fun ModelSelectorSheet(
     onDownloadModel: (HFModelConfig) -> Unit = {},
     onStartUsingModel: (HFModelConfig) -> Unit = {},
     onDeleteDownloadedModel: (String) -> Unit = {},
-    onPauseDownload: (String) -> Unit = {}
+    onPauseDownload: (String) -> Unit = {},
+    onCancelDownload: (String) -> Unit = {}
 ) {
     if (!isOpen) return
 

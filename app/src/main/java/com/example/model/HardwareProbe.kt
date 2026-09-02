@@ -80,15 +80,11 @@ data class HardwareInfo(
             } catch (e: Exception) {
                 false
             }
-            val vulkanLevel = try {
-                if (Build.VERSION.SDK_INT >= 29 && hasVulkan) {
-                    pm.getSystemFeatureLevel(PackageManager.FEATURE_VULKAN_HARDWARE_LEVEL, 0)
-                } else {
-                    0
-                }
-            } catch (e: Exception) {
-                0
-            }
+            // FEATURE_VULKAN_HARDWARE_LEVEL is only advertised on devices that expose
+            // Vulkan compute 1.1+, which is the threshold the GPU delegate cares about.
+            // (PackageManager#getSystemFeatureLevel is intentionally not used: it is not
+            // part of every compileSdk surface and adds nothing beyond this flag.)
+            val vulkanLevel = if (hasVulkan) 1 else 0
 
             val power = app.getSystemService(Context.POWER_SERVICE) as? PowerManager
             val powerSave = try {

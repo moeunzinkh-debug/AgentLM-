@@ -64,7 +64,7 @@ import kotlinx.coroutines.launch
 private object MarkdownParseCache {
     private const val MAX_ENTRIES = 24
     private val entries = object : LinkedHashMap<String, List<MarkdownBlock>>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<MarkdownBlock>>>): Boolean =
+        override fun removeEldestEntry(eldest: Map.Entry<String, List<MarkdownBlock>>?): Boolean =
             size > MAX_ENTRIES
     }
 

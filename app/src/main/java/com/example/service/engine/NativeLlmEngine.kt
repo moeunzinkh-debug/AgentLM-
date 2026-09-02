@@ -83,18 +83,21 @@ object NativeBackends {
 
     fun discover(): NativeLlmBackend? {
         if (probed) return cached
-        synchronized(this) {
-            if (probed) return cached
-            val found = try {
-                val cls = Class.forName(IMPL)
-                val instance = cls.getDeclaredConstructor().newInstance() as? NativeLlmBackend
-                instance?.takeIf { it.isAvailable() }
-            } catch (e: Throwable) {
-                null
+        return synchronized(this) {
+            if (probed) {
+                cached
+            } else {
+                val found = try {
+                    val cls = Class.forName(IMPL)
+                    val instance = cls.getDeclaredConstructor().newInstance() as? NativeLlmBackend
+                    instance?.takeIf { it.isAvailable() }
+                } catch (e: Throwable) {
+                    null
+                }
+                cached = found
+                probed = true
+                found
             }
-            cached = found
-            probed = true
-            found
         }
     }
 

@@ -367,7 +367,7 @@ object ModelCatalog {
             // Real weight size + measured KV-cache growth, not a size bucket guess.
             val advice = hardware?.let { ResponseBudgetAdvisor.advise(it, model) }
             val residentMb = advice?.modelResidentMb
-                ?: (model.sizeBytes / 1_048_576L * 1.3L).coerceAtLeast(32L)
+                ?: ((model.sizeBytes.toDouble() / 1_048_576.0) * 1.3).toLong().coerceAtLeast(32L)
             val required = ((residentMb + 420L) / 1024.0).let { kotlin.math.ceil(it.toDouble()) }.toInt().coerceAtLeast(2)
             val fits = free >= residentMb + 420L
             val isOptimal = free >= residentMb + 1_100L

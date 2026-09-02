@@ -50,7 +50,7 @@ class AiService(
 
     /** One shared native engine so the loaded weights survive across turns. */
     private val nativeEngine: NativeLlmEngine by lazy {
-        NativeLlmEngine { cacheDir().absolutePath }
+        NativeLlmEngine(cacheDirProvider = { cacheDir().absolutePath })
     }
 
     private fun cacheDir(): File = cacheRoot.apply { if (!exists()) mkdirs() }

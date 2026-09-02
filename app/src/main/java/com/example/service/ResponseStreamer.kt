@@ -3,7 +3,7 @@ package com.example.service
 import com.example.model.ResponsePolicy
 import com.example.service.engine.GenEvent
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.produceIn
@@ -90,7 +90,7 @@ class ResponseStreamer {
             onStats(stats)
         }
 
-        val channel: Channel<GenEvent> = events.buffer(128).produceIn(scope)
+        val channel: ReceiveChannel<GenEvent> = events.buffer(128).produceIn(scope)
         try {
             while (true) {
                 val now = System.currentTimeMillis()

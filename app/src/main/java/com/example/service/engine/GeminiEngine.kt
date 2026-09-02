@@ -65,7 +65,7 @@ class GeminiEngine(
         var finishReason = ""
         var blocked = false
 
-        val streamUrl = "$base/models/$model:streamGenerateContent?alt=sse&$keyParam()"
+        val streamUrl = "$base/models/$model:streamGenerateContent?alt=sse&${keyParam()}"
         val call = client.newCall(
             okhttp3.Request.Builder()
                 .url(streamUrl)
@@ -249,7 +249,7 @@ class GeminiEngine(
         if (key.isEmpty()) return EnginePing(false, "No Gemini API key", null)
         return try {
             val request = okhttp3.Request.Builder()
-                .url("$base/models?key=$keyParam()")
+                .url("$base/models?${keyParam()}")
                 .get()
                 .build()
             client.newCall(request).execute().use { resp ->

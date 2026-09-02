@@ -1212,7 +1212,7 @@ private fun ResponseTuningTab(
     val effectiveCtx = policy.effectiveContextBudget(advice.contextTokenBudget)
     val effectiveTurns = policy.effectiveHistoryTurns(advice.historyTurns)
     val kvPerTurnMb = effectiveCtx * advice.kvPerTokenKb / 1024.0
-    val repaintsPerSecond = 1000.0 / policy.flushIntervalMs.coerceAtLeast(1.0)
+    val repaintsPerSecond = 1000.0 / policy.flushIntervalMs.coerceAtLeast(1L).toDouble()
 
     Column(
         modifier = Modifier
