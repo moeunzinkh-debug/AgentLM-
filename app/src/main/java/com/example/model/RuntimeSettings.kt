@@ -100,7 +100,8 @@ data class EngineProfile(
             modelId = ""
         )
 
-        val DEFAULTS = listOf(GEMINI_BUILTIN, LOCAL_ENGINE, OLLAMA_LOCAL, HUGGINGFACE_ROUTER)
+        // Local first: the app's purpose is running the weights this phone already downloaded.
+        val DEFAULTS = listOf(LOCAL_ENGINE, GEMINI_BUILTIN, OLLAMA_LOCAL, HUGGINGFACE_ROUTER)
     }
 }
 
@@ -161,7 +162,7 @@ enum class SafetyMode(val label: String, val blurb: String) {
 data class RuntimeSettings(
     val policy: ResponsePolicy = ResponsePolicy(),
     val engines: List<EngineProfile> = EngineProfile.DEFAULTS,
-    val activeEngineId: String = EngineProfile.GEMINI_BUILTIN.id,
+    val activeEngineId: String = EngineProfile.LOCAL_ENGINE.id,
     val preferredHfQuant: String = "Q4_K_M",
     val autoApplyDeviceAdvice: Boolean = true
 ) {

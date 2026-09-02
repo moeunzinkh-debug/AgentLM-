@@ -9,9 +9,14 @@ configured, the app says so and links to the screen that fixes it.
 
 ---
 
-## 1. Make answers real
+## 1. Answers: local by default, cloud optional
 
-Open **Settings → Engines & Keys** and either
+The app starts on the **on-device** engine: download weights in Model Hub, press *Use offline*,
+and every reply is produced by the phone — no key, no network. The runtime is
+`com.google.ai.edge.litertlm:litertlm-android:0.12.0`, enabled by default in `gradle.properties`
+(`agentlm.nativeEngine=true`; set it to `false` for a slim APK that only uses servers).
+
+Prefer a server instead? Open **Settings → Engines & Keys** and pick one:
 
 * **Cloud (Gemini)** — put the key in `.env` as `GEMINI_API_KEY=...` (read through
   `secrets.properties`/`gradle.properties` at build time, see `app/build.gradle.kts`), or paste it
@@ -69,24 +74,26 @@ The place that "defines the response": persona/system prompt per agent (`Persona
 Everything persists in `SharedPreferences` as JSON (`RuntimeSettingsRepository`) and is clamped to
 the current device on every load.
 
-## 5. Optional on-device runtime
+## 5. The on-device runtime in detail
 
-`LiteRT-LM` (`com.google.ai.edge.litertlm:litertlm-android`) is compiled in only when asked, so a
-missing artifact can never break the default build:
+`LiteRT-LM` (`com.google.ai.edge.litertlm:litertlm-android:0.12.0`) is compiled in by default from
+the `app/src/litertlm/java` source set (Java/Kotlin target 17, minSdk 24 — same pinning as the
+reference client). `-Pagentlm.nativeEngine=false` removes the dependency, the source set and the
+`uses-native-library` entries' reason for existing, so an offline artifact mirror or a JVM-11 CI
+can still build the APK.
 
-```bash
-./gradlew assembleDebug -Pagentlm.nativeEngine=true
-```
-
-That adds the `app/src/litertlm/java` source set (Java 17 target) and the `uses-native-library`
-manifest entries. Reflection is limited to instantiating `com.example.litertlm.LiteRtLmBackend`;
-the same class can also be wired into a Flutter/other host, which is how the reference app does it.
+`NativeBackends.discover()` reaches the runtime through exactly one reflective lookup of a no-arg
+constructor (`com.example.litertlm.LiteRtLmBackend`); if it is absent, the engine reports
+"not compiled into this build" instead of failing mysteriously, and the chain falls through to the
+cloud/LAN engines. GPU (Vulkan) load failures retry on CPU — the failure class the reference app
+fixed in #11.
 
 ## Build
 
 ```bash
-./gradlew :app:assembleDebug
-./gradlew :app:testDebugUnitTest      # Robolectric: constructs ChatViewModel + renders the greeting
+./gradlew :app:assembleDebug               # on-device runtime included by default
+./gradlew :app:assembleDebug -Pagentlm.nativeEngine=false   # slim APK, server-only
+./gradlew :app:testDebugUnitTest           # Robolectric: constructs ChatViewModel + renders the greeting
 ```
 
 Verified in CI on this branch: `:app:compileDebugKotlin`, `:app:compileDebugAndroidTestKotlin` and

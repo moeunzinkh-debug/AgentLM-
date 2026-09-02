@@ -10,14 +10,18 @@ plugins {
 }
 
 // ---------------------------------------------------------------------------
-// Opt-in on-device inference runtime (Google AI Edge LiteRT-LM).
+// On-device inference runtime (Google AI Edge LiteRT-LM) — ON by default.
 //
-//   gradle assembleDebug -Pagentlm.nativeEngine=true
+// This is what makes "local AI" true in this app: Model Hub fetches a real GGUF/Safetensors
+// file and LiteRtLmBackend executes it on the phone, offline, with no API key.
 //
-// Off by default so the standard APK stays slim and never depends on a native artifact
-// it does not use. When enabled, LiteRtLmBackend is compiled in from src/litertlm/java
-// and discovered reflectively at runtime, so Model Hub downloads can actually execute
-// on the phone (offline) instead of needing a server.
+// Disable for a slim APK that only talks to an OpenAI-compatible server or Gemini:
+//
+//   gradle assembleDebug -Pagentlm.nativeEngine=false
+//
+// The reference client (orailnoor/cross-platform-llm-client) pins the same artifact
+// (litertlm-android:0.12.0) with the same Java 17 + minSdk 24 combination, so no other
+// build or manifest change is required.
 // ---------------------------------------------------------------------------
 val nativeEngineEnabled: Boolean =
   project.findProperty("agentlm.nativeEngine")?.toString()?.toBoolean() == true
@@ -86,6 +90,16 @@ android {
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
+  }
+}
+
+if (nativeEngineEnabled) {
+  // `android.compileOptions` only moves javac. The Kotlin compiler has to be aligned as well,
+  // otherwise litertlm-android's JVM-17 class files are rejected by a 11-target Kotlin module.
+  kotlin {
+    compilerOptions {
+      jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
   }
 }
 

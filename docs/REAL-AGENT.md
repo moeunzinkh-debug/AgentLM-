@@ -63,16 +63,17 @@ and how each is implemented here:
 | Markdown re-parse cost | While tokens arrive, the bubble renders plain text; full Markdown parsing runs once at commit. Completed bubbles are memoised by `MarkdownParseCache`. |
 | OOM/thrash on low-RAM devices | `maxOutputTokens` and the prompt budget are clamped from measured free RAM and the model's KV-cache growth; attachment bodies are truncated to the context window (`PromptBudget.clampBody`). |
 
-## 4. Optional: on-device execution
+## 4. On-device execution (the default)
 
-The native runtime is deliberately **not** in the default APK (it is a large native artifact and
-the standard build must stay green):
+`agentlm.nativeEngine=true` is set in `gradle.properties`, so a normal build already contains the
+runtime that executes the downloaded weights on the phone. Opt out for a slim, server-only APK:
 
 ```bash
-gradle assembleDebug -Pagentlm.nativeEngine=true
+gradle assembleDebug -Pagentlm.nativeEngine=false
 ```
 
-That adds `com.google.ai.edge.litertlm:litertlm-android`, compiles
+The enabled variant adds `com.google.ai.edge.litertlm:litertlm-android:0.12.0` (same pin as the
+reference client, which also uses Java 17 + minSdk 24), compiles
 `app/src/litertlm/java/.../LiteRtLmBackend.kt` (Engine → Conversation →
 `sendMessageAsync(Contents)` Flow → per-chunk `onDelta`) and aligns the module on JVM 17.
 `NativeBackends` finds it reflectively; Settings shows the runtime as READY, and Model Hub's

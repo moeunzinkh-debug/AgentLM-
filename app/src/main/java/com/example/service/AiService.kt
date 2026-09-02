@@ -158,9 +158,10 @@ class AiService(
                 EngineKind.GEMINI -> "Gemini is selected but no API key is configured."
                 EngineKind.OPENAI_COMPAT -> "No reachable inference endpoint is configured."
             },
-            hint = "Open Settings → Inference Engine: paste an API key, or point a base URL at Ollama / " +
-                "llama-server / LM Studio on your network, then press Test. AgentLM never fabricates a reply " +
-                "when no model can answer.",
+            hint = "Offline first: open Model Hub, download a quantization that fits this phone's RAM "
+                "and press \u201cUse offline\u201d — the weights then run on the device with no key at all. "
+                "Alternatively point Settings → Engines & Keys at Ollama / llama-server / LM Studio, or "
+                "add a Gemini key. AgentLM never fabricates a reply when no model can answer.",
             recoverable = true
         )
     }
