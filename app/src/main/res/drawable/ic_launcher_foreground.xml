@@ -1,0 +1,47 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Gradient AI Icon Shield / Hexagon -->
+    <path
+        android:pathData="M54,26 C41.85,26 32,35.85 32,48 C32,53.4 33.95,58.35 37.2,62.2 L37.2,74 C37.2,77.3 39.9,80 43.2,80 L64.8,80 C68.1,80 70.8,77.3 70.8,74 L70.8,62.2 C74.05,58.35 76,53.4 76,48 C76,35.85 66.15,26 54,26 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="32"
+                android:startY="26"
+                android:endX="76"
+                android:endY="80"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#06B6D4" />
+                <item android:offset="0.5" android:color="#6366F1" />
+                <item android:offset="1.0" android:color="#8B5CF6" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Neural Eyes / Spark Nodes -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M46,47m-3.5,0a3.5,3.5 0 1,0 7,0a3.5,3.5 0 1,0 -7,0" />
+
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M62,47m-3.5,0a3.5,3.5 0 1,0 7,0a3.5,3.5 0 1,0 -7,0" />
+
+    <!-- AI Smile Curve -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M48,58 C51.5,61 56.5,61 60,58" />
+
+    <!-- Sparkle Accents -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M78,28 L80,33 L85,35 L80,37 L78,42 L76,37 L71,35 L76,33 Z" />
+
+</vector>

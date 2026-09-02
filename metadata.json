@@ -1,0 +1,8 @@
+{
+  "name": "AgentLM",
+  "description": "A local-first and cloud AI agent with multiple personas, Hugging Face model selection, and fast streaming chat.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
